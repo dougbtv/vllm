@@ -14,6 +14,11 @@ logger = init_logger(__name__)
 
 
 def main():
+    # Demo: hello world for KubeCon
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        print("Hello, world!")
+        sys.exit(0)
+
     import vllm.entrypoints.cli.benchmark.main
     import vllm.entrypoints.cli.collect_env
     import vllm.entrypoints.cli.launch
