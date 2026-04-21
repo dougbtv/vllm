@@ -598,6 +598,7 @@ def _test_extract_tool_calls_streaming(
         "argument_before_name",
         "argument_before_name_and_name_in_argument",
         "multiple_tools",
+        "trailing_data_after_json",
     ],
     argnames=["model_output", "expected_tool_calls", "expected_content"],
     argvalues=[
@@ -686,6 +687,24 @@ def _test_extract_tool_calls_streaming(
                 ),
             ],
             "",
+        ),
+        (
+            """[TOOL_CALLS] [{"name": "get_current_weather", "arguments":{"city": "Dallas", "state": "TX", "unit": "fahrenheit"}}]\nextra trailing data""",  # noqa: E501
+            [
+                ToolCall(
+                    function=FunctionCall(
+                        name="get_current_weather",
+                        arguments=json.dumps(
+                            {
+                                "city": "Dallas",
+                                "state": "TX",
+                                "unit": "fahrenheit",
+                            }
+                        ),
+                    )
+                )
+            ],
+            "\nextra trailing data",
         ),
     ],
 )
@@ -1047,6 +1066,27 @@ def test_extract_tool_calls_streaming_v11_no_tools(
             ],
             "Some text",
             id="pre_v11-content_before_tool",
+        ),
+        pytest.param(
+            "mistral_pre_v11_tool_parser",
+            "mistral_pre_v11_tokenizer",
+            """[TOOL_CALLS] [{"name": "get_current_weather", "arguments":{"city": "Dallas", "state": "TX", "unit": "fahrenheit"}}]\nextra trailing data""",  # noqa: E501
+            [
+                ToolCall(
+                    function=FunctionCall(
+                        name="get_current_weather",
+                        arguments=json.dumps(
+                            {
+                                "city": "Dallas",
+                                "state": "TX",
+                                "unit": "fahrenheit",
+                            }
+                        ),
+                    )
+                )
+            ],
+            "\nextra trailing data",
+            id="pre_v11-trailing_data_after_json",
         ),
     ],
 )
