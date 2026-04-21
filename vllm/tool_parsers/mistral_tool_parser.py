@@ -482,27 +482,24 @@ class MistralToolParser(ToolParser):
                 # Use raw_decode to parse the first valid JSON value,
                 # ignoring trailing tokens the model may emit after
                 # the tool call array.
-                tool_calls, _ = json.JSONDecoder().raw_decode(
-                    stringified_tool_calls)
+                tool_calls, _ = json.JSONDecoder().raw_decode(stringified_tool_calls)
             except json.JSONDecodeError:
                 try:
                     raw_tool_call = self.tool_call_regex.findall(
                         stringified_tool_calls
                     )[0]
-                    tool_calls, _ = json.JSONDecoder().raw_decode(
-                        raw_tool_call)
+                    tool_calls, _ = json.JSONDecoder().raw_decode(raw_tool_call)
                     tool_calls = [
                         {
                             "name": tool_call["name"],
                             "arguments": json.dumps(
-                                tool_call["arguments"],
-                                ensure_ascii=False),
+                                tool_call["arguments"], ensure_ascii=False
+                            ),
                         }
                         for tool_call in tool_calls
                     ]
                 except (IndexError, json.JSONDecodeError):
-                    logger.exception(
-                        "Error in extracting tool call from response.")
+                    logger.exception("Error in extracting tool call from response.")
                     return ExtractedToolCallInformation(
                         tools_called=False,
                         tool_calls=[],
