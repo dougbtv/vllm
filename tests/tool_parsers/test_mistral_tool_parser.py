@@ -250,6 +250,7 @@ def test_extract_tool_calls_no_tools(parser_fixture, request):
         "argument_before_name_and_name_in_argument",
         "multiple_tools",
         "content_before_tool",
+        "trailing_data_after_json",
     ],
     argnames=["model_output", "expected_tool_calls", "expected_content"],
     argvalues=[
@@ -337,6 +338,24 @@ def test_extract_tool_calls_no_tools(parser_fixture, request):
                 )
             ],
             "Hello",
+        ),
+        (
+            """[TOOL_CALLS] [{"name": "get_current_weather", "arguments":{"city": "Dallas", "state": "TX", "unit": "fahrenheit"}}]\nextra trailing data""",  # noqa: E501
+            [
+                ToolCall(
+                    function=FunctionCall(
+                        name="get_current_weather",
+                        arguments=json.dumps(
+                            {
+                                "city": "Dallas",
+                                "state": "TX",
+                                "unit": "fahrenheit",
+                            }
+                        ),
+                    )
+                )
+            ],
+            None,
         ),
     ],
 )
