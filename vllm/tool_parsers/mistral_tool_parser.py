@@ -493,7 +493,8 @@ class MistralToolParser(ToolParser):
                         {
                             "name": tool_call["name"],
                             "arguments": json.dumps(
-                                tool_call["arguments"], ensure_ascii=False
+                                tool_call.get("arguments", {}),
+                                ensure_ascii=False,
                             ),
                         }
                         for tool_call in tool_calls
@@ -510,7 +511,8 @@ class MistralToolParser(ToolParser):
                     {
                         "name": tool_call["name"],
                         "arguments": json.dumps(
-                            tool_call["arguments"], ensure_ascii=False
+                            tool_call.get("arguments", {}),
+                            ensure_ascii=False,
                         ),
                     }
                     for tool_call in tool_calls
@@ -521,7 +523,7 @@ class MistralToolParser(ToolParser):
                 type="function",
                 function=FunctionCall(
                     name=tool_call["name"],
-                    arguments=tool_call["arguments"],
+                    arguments=tool_call.get("arguments", "{}"),
                 ),
             )
             for tool_call in tool_calls
