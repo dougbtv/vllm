@@ -488,7 +488,7 @@ class MistralToolParser(ToolParser):
                     raw_tool_call = self.tool_call_regex.findall(
                         stringified_tool_calls
                     )[0]
-                    tool_calls, _ = json.JSONDecoder().raw_decode(raw_tool_call)
+                    tool_calls = json.loads(raw_tool_call)
                     tool_calls = [
                         {
                             "name": tool_call["name"],
