@@ -7,5 +7,9 @@ packaging>=24.2
 setuptools-scm>=8
 wheel
 jinja2>=3.1.6
-setuptools>=78.1.1,<81.0.0
-tpu-inference@git+https://github.com/neuralmagic/tpu-inference@v0.16.0rc0
+ray[default]
+ray[data]
+setuptools==78.1.0
+setuptools-rust>=1.9.0
+nixl==0.3.0
+tpu-inference==0.19.0
