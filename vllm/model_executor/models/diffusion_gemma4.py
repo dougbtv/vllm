@@ -36,7 +36,6 @@ from vllm.model_executor.models.gemma4 import (
     Gemma4Model,
 )
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -339,7 +338,7 @@ def _compiled_sample_step(
     # Gumbel-max trick: argmax(logits/T + Gumbel) ~ sample from softmax(logits/T)
     u = torch.rand_like(scaled).clamp(min=1e-20)
     gumbel = -torch.log(-torch.log(u))
-    # Zero noise when temp==0 (greedy) to match Triton kernel behavior
+    # Zero noise when temp==0 (greedy)
     noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
     new_tokens = noisy.view(-1, noisy.shape[-1]).argmax(dim=-1).view(num_decode, CL)
     argmax_tokens = scaled.view(-1, scaled.shape[-1]).argmax(dim=-1).view(
@@ -363,7 +362,7 @@ def _compiled_sample_step(
         eb_mask = torch.zeros_like(sorted_mask)
         eb_mask.scatter_(1, sorted_idx, sorted_mask)
 
-    # ---- Phase 5: Post-sample (replaces _diffusion_post_sample_kernel) ----
+    # ---- Phase 5: Post-sample ----
     is_commit = is_encoder_phase[decode_slots]          # [num_decode]
     is_denoise = ~is_commit
     cur_step = step_tensor[decode_slots].float()
@@ -569,194 +568,6 @@ class DiffusionGemma4RequestStates:
         self.is_encoder_phase[slot_idx] = False
         self.accepted_canvas_history_len[slot_idx] = 0
         self.self_conditioning_probs[slot_idx] = 0
-
-
-@triton.jit
-def _diffusion_post_sample_kernel(
-    new_tokens_ptr,
-    argmax_tokens_ptr,
-    canvas_ptr,
-    argmax_canvas_ptr,
-    step_ptr,
-    is_encoder_ptr,
-    confident_ptr,
-    history_ptr,
-    history_len_ptr,
-    sc_probs_ptr,
-    sampled_ptr,
-    num_sampled_ptr,
-    decode_slots_ptr,
-    decode_idx_ptr,
-    accepted_mask_ptr,
-    canvas_stride,
-    argmax_canvas_stride,
-    history_stride_req,
-    history_stride_step,
-    sc_probs_stride_req,
-    sc_probs_stride_pos,
-    sampled_stride,
-    accepted_mask_stride,
-    max_steps,
-    renoise_ratio_modifier: tl.constexpr,
-    ar_mask_noise_proportion: tl.constexpr,
-    use_autoregressive_mask: tl.constexpr,
-    vocab_size,
-    seed,
-    CANVAS_LEN: tl.constexpr,
-    ST: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    VOCAB_BLOCK: tl.constexpr,
-    USE_ENTROPY_BOUND: tl.constexpr = False,
-):
-    """Fused commit/denoise/convergence for one decode request."""
-    req_local = tl.program_id(0)
-    slot = tl.load(decode_slots_ptr + req_local)
-    batch_idx = tl.load(decode_idx_ptr + req_local)
-    is_enc = tl.load(is_encoder_ptr + slot)
-
-    if is_enc:
-        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
-            offsets = start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < CANVAS_LEN
-            best_tok = tl.load(
-                argmax_canvas_ptr + slot * argmax_canvas_stride + offsets,
-                mask=mask,
-            )
-            tl.store(
-                sampled_ptr + batch_idx * sampled_stride + offsets,
-                best_tok.to(tl.int32),
-                mask=mask,
-            )
-            random_tok = (
-                tl.rand(seed + 2, slot * CANVAS_LEN + offsets) * vocab_size
-            ).to(tl.int64)
-            tl.store(
-                canvas_ptr + slot * canvas_stride + offsets,
-                random_tok,
-                mask=mask,
-            )
-        for pos in range(CANVAS_LEN):
-            base = slot * sc_probs_stride_req + pos * sc_probs_stride_pos
-            for vstart in range(0, vocab_size, VOCAB_BLOCK):
-                voffs = vstart + tl.arange(0, VOCAB_BLOCK)
-                vmask = voffs < vocab_size
-                tl.store(sc_probs_ptr + base + voffs, 0.0, mask=vmask)
-        tl.store(num_sampled_ptr + batch_idx, CANVAS_LEN)
-        tl.store(step_ptr + slot, 0)
-        tl.store(is_encoder_ptr + slot, 0)
-        tl.store(history_len_ptr + slot, 0)
-    else:
-        step = tl.load(step_ptr + slot).to(tl.float32)
-        tl.store(step_ptr + slot, (step + 1.0).to(tl.int32))
-        if not USE_ENTROPY_BOUND:
-            remaining = tl.maximum(max_steps - step, 1.0)
-            accept_prob = 1.0 / remaining
-            renoise_prob = (
-                renoise_ratio_modifier * tl.maximum(remaining - 1.0, 0.0) / max_steps
-            )
-            ar_threshold = (step + 1.0) / max_steps
-
-        hist_len = tl.load(history_len_ptr + slot)
-        write_pos = hist_len % ST
-
-        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
-            offsets = start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < CANVAS_LEN
-            new_tok = tl.load(
-                new_tokens_ptr + req_local * CANVAS_LEN + offsets,
-                mask=mask,
-            )
-            argmax_tok = tl.load(
-                argmax_tokens_ptr + req_local * CANVAS_LEN + offsets,
-                mask=mask,
-            )
-            tl.store(
-                history_ptr
-                + slot * history_stride_req
-                + write_pos * history_stride_step
-                + offsets,
-                argmax_tok,
-                mask=mask,
-            )
-            tl.store(
-                argmax_canvas_ptr + slot * argmax_canvas_stride + offsets,
-                argmax_tok,
-                mask=mask,
-            )
-            random_tok = (
-                tl.rand(seed + 1, req_local * CANVAS_LEN + offsets) * vocab_size
-            ).to(tl.int64)
-
-            if USE_ENTROPY_BOUND:
-                eb_mask = tl.load(
-                    accepted_mask_ptr + req_local * accepted_mask_stride + offsets,
-                    mask=mask,
-                ).to(tl.int1)
-                tok = tl.where(eb_mask, new_tok, random_tok)
-            else:
-                cur_tok = tl.load(
-                    canvas_ptr + slot * canvas_stride + offsets,
-                    mask=mask,
-                )
-                r_accept = tl.rand(
-                    seed,
-                    req_local * CANVAS_LEN * 2 + offsets * 2,
-                )
-                accept_mask = r_accept < accept_prob
-                if use_autoregressive_mask:
-                    canvas_proportion = (
-                        offsets.to(tl.float32)
-                        * (1.0 - ar_mask_noise_proportion)
-                        / (CANVAS_LEN - 1)
-                    )
-                    accept_mask = accept_mask | (canvas_proportion <= ar_threshold)
-                accepted = tl.where(accept_mask, new_tok, cur_tok)
-                r_renoise = tl.rand(
-                    seed,
-                    req_local * CANVAS_LEN * 2 + offsets * 2 + 1,
-                )
-                tok = tl.where(r_renoise < renoise_prob, random_tok, accepted)
-
-            tl.store(
-                canvas_ptr + slot * canvas_stride + offsets,
-                tok,
-                mask=mask,
-            )
-
-        new_hist_len = hist_len + 1
-        tl.store(history_len_ptr + slot, new_hist_len)
-
-        any_mismatch = 0
-        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
-            offsets = start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < CANVAS_LEN
-            ref = tl.load(
-                history_ptr + slot * history_stride_req + offsets,
-                mask=mask,
-                other=-1,
-            )
-            for h in range(1, ST):
-                h_tok = tl.load(
-                    history_ptr
-                    + slot * history_stride_req
-                    + h * history_stride_step
-                    + offsets,
-                    mask=mask,
-                    other=-2,
-                )
-                any_mismatch += tl.sum(
-                    tl.where(mask, (ref != h_tok).to(tl.int32), 0),
-                    axis=0,
-                )
-
-        stable = any_mismatch == 0
-        confident = tl.load(confident_ptr + slot)
-        step_after = tl.load(step_ptr + slot)
-        converged = (stable & confident & (new_hist_len >= ST)) | (
-            step_after >= max_steps
-        )
-        tl.store(is_encoder_ptr + slot, converged)
-
 
 class DiffusionGemma4ModelState(ModelState):
     """ModelState for DiffusionGemma4.
