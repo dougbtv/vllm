@@ -253,7 +253,7 @@ class FlashAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
 
-    causal: bool = True
+    causal: bool | torch.Tensor = True
 
 
 def _get_sliding_window_configs(
@@ -552,6 +552,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        if isinstance(causal, torch.Tensor) and causal.dtype != torch.int32:
+            causal = causal.to(torch.int32)
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -793,6 +796,32 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
+
+                causal = attn_metadata.causal
+
+                # For non-causal (bidirectional) attention, make the
+                # sliding window symmetric so queries attend in both
+                # directions.
+                if (
+                    sliding_window_size is not None
+                    and sliding_window_size[1] == 0
+                    and (causal is False or isinstance(causal, torch.Tensor))
+                ):
+                    sliding_window_size = [
+                        sliding_window_size[0],
+                        sliding_window_size[0],
+                    ]
+                dynamic_causal = None
+                if isinstance(causal, torch.Tensor):
+                    if self.vllm_flash_attn_version != 4:
+                        raise NotImplementedError(
+                            "Per-sequence causal requires FA4. "
+                            f"Current version: "
+                            f"FA{self.vllm_flash_attn_version}"
+                        )
+                    dynamic_causal = causal
+                    causal = False
+
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -803,7 +832,7 @@ class FlashAttentionImpl(AttentionImpl):
                     seqused_k=seqused_k,
                     max_seqlen_k=max_seqlen_k,
                     softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
+                    causal=causal,
                     alibi_slopes=self.alibi_slopes,
                     window_size=sliding_window_size,
                     block_table=block_table,
@@ -813,6 +842,7 @@ class FlashAttentionImpl(AttentionImpl):
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    dynamic_causal=dynamic_causal,
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )

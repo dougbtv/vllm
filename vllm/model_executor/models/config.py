@@ -106,6 +106,112 @@ class Gemma4Config(VerifyAndUpdateConfig):
             )
 
 
+class DiffusionGemma4ModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
+    DEFAULT_T_MIN = 0.4
+    DEFAULT_T_MAX = 0.8
+    DEFAULT_SAMPLER = "ar_euler"
+    DEFAULT_STABILITY_THRESHOLD = 1
+    DEFAULT_CONFIDENCE_THRESHOLD = 0.005
+
+    @classmethod
+    def _load_generation_config(cls, vllm_config: "VllmConfig") -> dict:
+        """Load diffusion-specific fields from generation_config.json."""
+        gen_cfg = vllm_config.model_config.try_get_generation_config()
+        result = {}
+        # Extract sampler config.
+        sampler_cfg = gen_cfg.get("sampler_config", {})
+        if isinstance(sampler_cfg, dict):
+            cls_name = sampler_cfg.get("_cls_name", "")
+            if "EntropyBound" in cls_name:
+                result["sampler"] = "entropy_bound"
+                result["entropy_bound"] = sampler_cfg.get("entropy_bound")
+            else:
+                result["sampler"] = "ar_euler"
+        # Extract stopping config.
+        stop_cfg = gen_cfg.get("diffusion_stopping_config", {})
+        if isinstance(stop_cfg, dict):
+            if "stability_threshold" in stop_cfg:
+                result["stability_threshold"] = stop_cfg["stability_threshold"]
+            if "confidence_threshold" in stop_cfg:
+                result["confidence_threshold"] = stop_cfg["confidence_threshold"]
+        # Extract temperature config.
+        temp_cfg = gen_cfg.get("linear_temperature_schedule_config", {})
+        if isinstance(temp_cfg, dict):
+            if "t_min" in temp_cfg:
+                result["t_min"] = temp_cfg["t_min"]
+            if "t_max" in temp_cfg:
+                result["t_max"] = temp_cfg["t_max"]
+        return result
+
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        """Force vllm_c kernels and set diffusion defaults for DiffusionGemma4.
+
+        Inductor's native-op fusions accumulate small fp differences vs
+        the vllm_c C++ kernels across many denoise steps. Enable custom
+        ops and force vllm_c RMSNorm via IR priority to match eager.
+
+        Also auto-creates DiffusionConfig from the HF config when the
+        user didn't pass ``--diffusion-config``, and populates
+        model-specific sampling parameters on hf_config from
+        generation_config.json.
+        """
+        # Auto-create DiffusionConfig from HF config if not provided.
+        if vllm_config.diffusion_config is None:
+            from vllm.config.diffusion import DiffusionConfig
+
+            hf_config = vllm_config.model_config.hf_config
+            canvas_length = getattr(hf_config, "canvas_length", 256)
+            vllm_config.diffusion_config = DiffusionConfig(
+                canvas_length=canvas_length,
+            )
+
+        cc = vllm_config.compilation_config
+        if (
+            cc is not None
+            and "all" not in cc.custom_ops
+            and "none" not in cc.custom_ops
+        ):
+            cc.custom_ops = ["all"]
+
+        kc = vllm_config.kernel_config
+        kc.ir_op_priority.rms_norm = ["vllm_c", "native"]
+        kc.ir_op_priority.fused_add_rms_norm = ["vllm_c", "native"]
+
+        # Load defaults from generation_config.json, then allow
+        # hf_overrides to take precedence.
+        gen = cls._load_generation_config(vllm_config)
+        hf_config = vllm_config.model_config.hf_config
+
+        def _set_default(attr: str, gen_key: str, fallback):
+            if not hasattr(hf_config, attr):
+                setattr(hf_config, attr, gen.get(gen_key, fallback))
+
+        _set_default("diffusion_t_min", "t_min", cls.DEFAULT_T_MIN)
+        _set_default("diffusion_t_max", "t_max", cls.DEFAULT_T_MAX)
+        _set_default("diffusion_sampler", "sampler", cls.DEFAULT_SAMPLER)
+        _set_default("diffusion_entropy_bound", "entropy_bound", None)
+        _set_default(
+            "diffusion_stability_threshold",
+            "stability_threshold",
+            cls.DEFAULT_STABILITY_THRESHOLD,
+        )
+        _set_default(
+            "diffusion_confidence_threshold",
+            "confidence_threshold",
+            cls.DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+
+        if hf_config.diffusion_sampler == "entropy_bound":
+            eb = hf_config.diffusion_entropy_bound
+            if eb is None or eb <= 0:
+                raise ValueError(
+                    "diffusion_entropy_bound must be a positive float "
+                    "when diffusion_sampler='entropy_bound' "
+                    f"(got {eb})"
+                )
+
+
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -592,6 +698,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColQwen3_5": Qwen3_5ForConditionalGenerationConfig,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
+    "DiffusionGemma4ModelForBlockDiffusion": DiffusionGemma4ModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,

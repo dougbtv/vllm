@@ -28,9 +28,11 @@ class AsyncScheduler(Scheduler):
                 request.use_structured_output and request.num_output_placeholders > 0
             )
             # The request will generate a new token plus num_spec_tokens
-            # in this scheduling step.
+            # in this scheduling step. Diffusion has no AR bonus token —
+            # only the canvas (spec) tokens.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
-            request.num_output_placeholders += 1 + cur_num_spec_tokens
+            num_sampled = 0 if self.vllm_config.model_config.is_diffusion else 1
+            request.num_output_placeholders += num_sampled + cur_num_spec_tokens
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = self._spec_token_placeholders

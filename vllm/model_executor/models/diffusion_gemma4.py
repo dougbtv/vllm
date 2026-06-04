@@ -1,0 +1,1145 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""DiffusionGemma4 model, ModelState, and Sampler for vLLM.
+
+Single Gemma4 backbone run in two modes (like YOCO):
+- encoder mode: causal attention, writes KV cache
+- decoder mode: bidirectional attention, reads encoder KV, doesn't write
+
+Same weights, same layers. The only decoder-unique component is a
+self-conditioning MLP.
+
+Design doc: docs/design/diffusion_gemma4_summary.md
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Any
+
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+)
+
+# Reuse Gemma4 components directly
+from vllm.model_executor.models.gemma4 import (
+    Gemma4Model,
+)
+from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+logger = init_logger(__name__)
+
+
+class DiffusionGemma4SelfConditioning(nn.Module):
+    """Gated MLP that processes soft embeddings from the previous denoising step.
+
+    Structurally identical to Gemma4MLP but with self_conditioning_size
+    and post_norm without learned scale.
+    """
+
+    def __init__(
+        self, hidden_size: int, self_conditioning_size: int, eps: float = 1e-6
+    ):
+        super().__init__()
+        self.pre_norm = RMSNorm(hidden_size, eps=eps)
+        self.post_norm = RMSNorm(hidden_size, eps=eps, has_weight=False)
+        self.gate_proj = nn.Linear(hidden_size, self_conditioning_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, self_conditioning_size, bias=False)
+        self.down_proj = nn.Linear(self_conditioning_size, hidden_size, bias=False)
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        soft_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.pre_norm(soft_embeds)
+        sc_signal = self.down_proj(
+            F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x)
+        )
+        return self.post_norm(inputs_embeds + sc_signal)
+
+
+class DiffusionGemma4ForConditionalGeneration(nn.Module):
+    """DiffusionGemma4 for vLLM.
+
+    Single Gemma4 backbone that switches between encoder and decoder mode.
+    The encoder path uses standard Gemma4 layers (causal attention, KV write).
+    The decoder path uses the same weights with bidirectional attention and
+    KV read-only, plus self-conditioning.
+
+    In practice, the model's forward() dispatches based on the `mode` kwarg
+    set by DiffusionGemma4ModelState.prepare_inputs().
+    """
+
+    @staticmethod
+    def get_model_state_cls():
+        return DiffusionGemma4ModelState
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        text_config = vllm_config.model_config.hf_text_config
+        self.config = config
+
+        # DiffusionGemma4 feeds raw (non-prenormed) input to the MoE router,
+        # matching the HF decoder which does router(residual) not
+        # router(pre_norm(residual)).
+        text_config.router_uses_prenormed_input = False
+
+        # DiffusionGemma4's full-attention layers have NO v_proj — V is
+        # computed from k_proj's output (`value_states = key_states` before
+        # k_norm in `DiffusionGemma4DecoderTextAttention.forward`). This is
+        # the "k_eq_v" variant in our Gemma4 backbone. The checkpoint has no
+        # v_proj weights for full-attention layers; without this flag they
+        # would silently load with random V projections.
+        text_config.attention_k_eq_v = True
+
+        self.model = Gemma4Model(
+            vllm_config=vllm_config,
+            prefix=f"{prefix}.model",
+        )
+
+        self.lm_head = ParallelLMHead(
+            num_embeddings=text_config.vocab_size,
+            embedding_dim=text_config.hidden_size,
+        )
+
+        if text_config.tie_word_embeddings:
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+
+        # HF DiffusionGemma4 applies the final-logit softcap in fp32, before
+        # any other processing. Do it manually in `compute_logits` so the
+        # LogitsProcessor only handles the lm_head GEMM.
+        self.final_logit_softcapping = getattr(
+            text_config, "final_logit_softcapping", None
+        )
+        self.logits_processor = LogitsProcessor(
+            text_config.vocab_size,
+            soft_cap=None,
+        )
+
+        sc_size = (
+            getattr(config, "self_conditioning_size", None)
+            or text_config.intermediate_size
+        )
+        self.self_conditioning = DiffusionGemma4SelfConditioning(
+            hidden_size=text_config.hidden_size,
+            self_conditioning_size=sc_size,
+            eps=getattr(text_config, "rms_norm_eps", 1e-6),
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def compute_self_conditioning(
+        self,
+        inputs_embeds: torch.Tensor,
+        probs: torch.Tensor,
+    ) -> torch.Tensor:
+        embed_weight = self.model.embed_tokens.weight
+        soft_embeds = torch.matmul(
+            probs.to(embed_weight.dtype), embed_weight
+        ) * self.model.normalizer.to(inputs_embeds.dtype)
+        return self.self_conditioning(inputs_embeds, soft_embeds)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Any | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None and self.final_logit_softcapping is not None:
+            # HF DiffusionGemma4 casts to fp32 before softcap for numerical
+            # stability of the tanh.
+            logits = logits.float()
+            cap = self.final_logit_softcapping
+            logits = torch.tanh(logits / cap) * cap
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        """Load weights from checkpoint.
+
+        Checkpoint layout (HF DiffusionGemma4):
+          model.encoder.language_model.layers.*  → backbone
+          model.decoder.layers.*                 → backbone (tied)
+          model.decoder.embed_tokens.*           → embeddings
+          self_conditioning.*                    → self-conditioning MLP
+          lm_head.*                              → LM head (tied)
+
+        We load encoder weights into our single ``Gemma4Model`` backbone,
+        skip duplicate decoder backbone weights, and handle
+        self-conditioning separately.
+        """
+
+        sc_params = dict(
+            (n, p)
+            for n, p in self.named_parameters()
+            if n.startswith("self_conditioning.")
+        )
+
+        def _remap_weights():
+            seen_layers: set[str] = set()
+            for name, weight in weights:
+                # Self-conditioning lives under model.decoder.self_conditioning.*
+                # in the checkpoint but at self_conditioning.* in our model.
+                if "self_conditioning" in name:
+                    sc_name = name.split("self_conditioning.", 1)[1]
+                    sc_name = "self_conditioning." + sc_name
+                    if sc_name in sc_params:
+                        sc_params[sc_name].data.copy_(weight)
+                    continue
+                # Encoder backbone → model.*
+                if name.startswith("model.encoder.language_model."):
+                    name = name.replace("model.encoder.language_model.", "model.")
+                # Decoder backbone → model.* (skip duplicates)
+                elif name.startswith("model.decoder."):
+                    name = name.replace("model.decoder.", "model.")
+                    layer_key = name.split(".weight")[0].split(".bias")[0]
+                    if layer_key in seen_layers:
+                        continue
+                seen_layers.add(name.split(".weight")[0].split(".bias")[0])
+                yield name, weight
+
+        # Delegate to Gemma4ForCausalLM.load_weights for the backbone,
+        # which handles stacked params, MoE, k_eq_v, etc.
+        # Temporarily set self.config to text_config since Gemma4's
+        # load_weights expects it (e.g. tie_word_embeddings, layer_types).
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+
+        saved_config = self.config
+        self.config = self.model.config
+        try:
+            Gemma4ForCausalLM.load_weights(self, _remap_weights())
+        finally:
+            self.config = saved_config
+
+
+DEFAULT_STABILITY_THRESHOLD = 2
+DEFAULT_CONFIDENCE_THRESHOLD = 0.005
+
+
+@torch.compile(dynamic=True)
+def _compute_num_rejected(
+    num_logits: torch.Tensor,
+    num_sampled: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> torch.Tensor:
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    num_rejected = num_logits - num_sampled
+    is_denoise = (num_logits > 0) & (num_sampled == 0)
+    return torch.where(is_denoise, query_lens, num_rejected)
+
+
+class DiffusionGemma4RequestStates:
+    """Pre-allocated GPU tensors for DiffusionGemma4 per-request state.
+
+    Follows the indexed-slot pattern used by ``RequestState``.
+    """
+
+    def __init__(
+        self,
+        max_num_reqs: int,
+        canvas_length: int,
+        vocab_size: int,
+        max_denoising_steps: int,
+        device: torch.device,
+        hidden_size: int,
+        stability_threshold: int = DEFAULT_STABILITY_THRESHOLD,
+    ):
+        self.max_num_reqs = max_num_reqs
+        self.canvas_length = canvas_length
+        self.vocab_size = vocab_size
+        self.max_denoising_steps = max_denoising_steps
+        self.stability_threshold = stability_threshold
+        self.device = device
+
+        self.is_encoder_phase = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
+        # Canvas tokens [max_num_reqs, canvas_length]
+        self.canvas = torch.zeros(
+            max_num_reqs, canvas_length, dtype=torch.int64, device=device
+        )
+        # Step counter (counts up from 0 to max_denoising_steps)
+        self.step = torch.zeros(
+            max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        # Accepted canvas history for stability check
+        self.accepted_canvas_history = torch.zeros(
+            max_num_reqs,
+            stability_threshold,
+            canvas_length,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.accepted_canvas_history_len = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        # Latest argmax(processed_logits) per slot — what we COMMIT.
+        # HF reference commits `argmax_canvas` (argmax of latest step's logits),
+        # NOT `current_canvas` (which is the post-renoise stochastic input for
+        # the next denoise step). We keep this separate from `canvas` because
+        # canvas gets renoised in-place during denoise, while argmax_canvas is
+        # the deterministic best-guess we ultimately emit.
+        self.argmax_canvas = torch.zeros(
+            max_num_reqs, canvas_length, dtype=torch.int64, device=device
+        )
+
+        # Per-slot prompt length (set by add_request).
+        self.prompt_len = torch.zeros(
+            max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # Per-slot confidence flag, set by the sampler each step.
+        self.confident = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
+
+        # Per-slot probs from the previous denoise step, set by the sampler.
+        self.self_conditioning_probs = torch.zeros(
+            max_num_reqs, canvas_length, vocab_size, dtype=torch.float32, device=device
+        )
+
+    def init_canvas(self, slot_indices_np: np.ndarray) -> None:
+        """Initialize canvas with random tokens for the given slots."""
+        n = slot_indices_np.shape[0]
+        self.canvas[slot_indices_np] = torch.randint(
+            0,
+            self.vocab_size,
+            (n, self.canvas_length),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+    def add_request(self, slot_idx: int) -> None:
+        self.is_encoder_phase[slot_idx] = True
+        self.init_canvas(torch.tensor([slot_idx], device=self.device))
+        self.step[slot_idx] = 0
+        self.accepted_canvas_history_len[slot_idx] = 0
+        self.self_conditioning_probs[slot_idx] = 0
+
+    def remove_request(self, slot_idx: int) -> None:
+        self.is_encoder_phase[slot_idx] = False
+        self.accepted_canvas_history_len[slot_idx] = 0
+        self.self_conditioning_probs[slot_idx] = 0
+
+
+@triton.jit
+def _diffusion_post_sample_kernel(
+    new_tokens_ptr,
+    argmax_tokens_ptr,
+    canvas_ptr,
+    argmax_canvas_ptr,
+    step_ptr,
+    is_encoder_ptr,
+    confident_ptr,
+    history_ptr,
+    history_len_ptr,
+    sc_probs_ptr,
+    sampled_ptr,
+    num_sampled_ptr,
+    decode_slots_ptr,
+    decode_idx_ptr,
+    accepted_mask_ptr,
+    canvas_stride,
+    argmax_canvas_stride,
+    history_stride_req,
+    history_stride_step,
+    sc_probs_stride_req,
+    sc_probs_stride_pos,
+    sampled_stride,
+    accepted_mask_stride,
+    max_steps,
+    renoise_ratio_modifier: tl.constexpr,
+    ar_mask_noise_proportion: tl.constexpr,
+    use_autoregressive_mask: tl.constexpr,
+    vocab_size,
+    seed,
+    CANVAS_LEN: tl.constexpr,
+    ST: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    VOCAB_BLOCK: tl.constexpr,
+    USE_ENTROPY_BOUND: tl.constexpr = False,
+):
+    """Fused commit/denoise/convergence for one decode request."""
+    req_local = tl.program_id(0)
+    slot = tl.load(decode_slots_ptr + req_local)
+    batch_idx = tl.load(decode_idx_ptr + req_local)
+    is_enc = tl.load(is_encoder_ptr + slot)
+
+    if is_enc:
+        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
+            offsets = start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < CANVAS_LEN
+            best_tok = tl.load(
+                argmax_canvas_ptr + slot * argmax_canvas_stride + offsets,
+                mask=mask,
+            )
+            tl.store(
+                sampled_ptr + batch_idx * sampled_stride + offsets,
+                best_tok.to(tl.int32),
+                mask=mask,
+            )
+            random_tok = (
+                tl.rand(seed + 2, slot * CANVAS_LEN + offsets) * vocab_size
+            ).to(tl.int64)
+            tl.store(
+                canvas_ptr + slot * canvas_stride + offsets,
+                random_tok,
+                mask=mask,
+            )
+        for pos in range(CANVAS_LEN):
+            base = slot * sc_probs_stride_req + pos * sc_probs_stride_pos
+            for vstart in range(0, vocab_size, VOCAB_BLOCK):
+                voffs = vstart + tl.arange(0, VOCAB_BLOCK)
+                vmask = voffs < vocab_size
+                tl.store(sc_probs_ptr + base + voffs, 0.0, mask=vmask)
+        tl.store(num_sampled_ptr + batch_idx, CANVAS_LEN)
+        tl.store(step_ptr + slot, 0)
+        tl.store(is_encoder_ptr + slot, 0)
+        tl.store(history_len_ptr + slot, 0)
+    else:
+        step = tl.load(step_ptr + slot).to(tl.float32)
+        tl.store(step_ptr + slot, (step + 1.0).to(tl.int32))
+        if not USE_ENTROPY_BOUND:
+            remaining = tl.maximum(max_steps - step, 1.0)
+            accept_prob = 1.0 / remaining
+            renoise_prob = (
+                renoise_ratio_modifier * tl.maximum(remaining - 1.0, 0.0) / max_steps
+            )
+            ar_threshold = (step + 1.0) / max_steps
+
+        hist_len = tl.load(history_len_ptr + slot)
+        write_pos = hist_len % ST
+
+        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
+            offsets = start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < CANVAS_LEN
+            new_tok = tl.load(
+                new_tokens_ptr + req_local * CANVAS_LEN + offsets,
+                mask=mask,
+            )
+            argmax_tok = tl.load(
+                argmax_tokens_ptr + req_local * CANVAS_LEN + offsets,
+                mask=mask,
+            )
+            tl.store(
+                history_ptr
+                + slot * history_stride_req
+                + write_pos * history_stride_step
+                + offsets,
+                argmax_tok,
+                mask=mask,
+            )
+            tl.store(
+                argmax_canvas_ptr + slot * argmax_canvas_stride + offsets,
+                argmax_tok,
+                mask=mask,
+            )
+            random_tok = (
+                tl.rand(seed + 1, req_local * CANVAS_LEN + offsets) * vocab_size
+            ).to(tl.int64)
+
+            if USE_ENTROPY_BOUND:
+                eb_mask = tl.load(
+                    accepted_mask_ptr + req_local * accepted_mask_stride + offsets,
+                    mask=mask,
+                ).to(tl.int1)
+                tok = tl.where(eb_mask, new_tok, random_tok)
+            else:
+                cur_tok = tl.load(
+                    canvas_ptr + slot * canvas_stride + offsets,
+                    mask=mask,
+                )
+                r_accept = tl.rand(
+                    seed,
+                    req_local * CANVAS_LEN * 2 + offsets * 2,
+                )
+                accept_mask = r_accept < accept_prob
+                if use_autoregressive_mask:
+                    canvas_proportion = (
+                        offsets.to(tl.float32)
+                        * (1.0 - ar_mask_noise_proportion)
+                        / (CANVAS_LEN - 1)
+                    )
+                    accept_mask = accept_mask | (canvas_proportion <= ar_threshold)
+                accepted = tl.where(accept_mask, new_tok, cur_tok)
+                r_renoise = tl.rand(
+                    seed,
+                    req_local * CANVAS_LEN * 2 + offsets * 2 + 1,
+                )
+                tok = tl.where(r_renoise < renoise_prob, random_tok, accepted)
+
+            tl.store(
+                canvas_ptr + slot * canvas_stride + offsets,
+                tok,
+                mask=mask,
+            )
+
+        new_hist_len = hist_len + 1
+        tl.store(history_len_ptr + slot, new_hist_len)
+
+        any_mismatch = 0
+        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
+            offsets = start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < CANVAS_LEN
+            ref = tl.load(
+                history_ptr + slot * history_stride_req + offsets,
+                mask=mask,
+                other=-1,
+            )
+            for h in range(1, ST):
+                h_tok = tl.load(
+                    history_ptr
+                    + slot * history_stride_req
+                    + h * history_stride_step
+                    + offsets,
+                    mask=mask,
+                    other=-2,
+                )
+                any_mismatch += tl.sum(
+                    tl.where(mask, (ref != h_tok).to(tl.int32), 0),
+                    axis=0,
+                )
+
+        stable = any_mismatch == 0
+        confident = tl.load(confident_ptr + slot)
+        step_after = tl.load(step_ptr + slot)
+        converged = (stable & confident & (new_hist_len >= ST)) | (
+            step_after >= max_steps
+        )
+        tl.store(is_encoder_ptr + slot, converged)
+
+
+class DiffusionGemma4ModelState(ModelState):
+    """ModelState for DiffusionGemma4.
+
+    Single Gemma4 backbone in two modes:
+    - encoder mode (num_draft_tokens == 0): causal attention, writes KV
+    - decoder mode (num_draft_tokens > 0): bidirectional attention, reads KV
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: Any,
+        device: torch.device,
+    ) -> None:
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.model = model
+        self.device = device
+
+        self.max_num_reqs = self.scheduler_config.max_num_seqs
+        self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
+        self.max_model_len = self.model_config.max_model_len
+
+        diffusion_config = vllm_config.diffusion_config
+        canvas_length = diffusion_config.canvas_length if diffusion_config else 32
+        max_denoising_steps = (
+            diffusion_config.max_denoising_steps if diffusion_config else 48
+        )
+
+        text_config = self.model_config.hf_text_config
+        hf_config = self.model_config.hf_config
+        self.diffusion_states = DiffusionGemma4RequestStates(
+            max_num_reqs=self.max_num_reqs,
+            canvas_length=canvas_length,
+            vocab_size=self.model_config.get_vocab_size(),
+            max_denoising_steps=max_denoising_steps,
+            device=device,
+            hidden_size=text_config.hidden_size,
+            stability_threshold=getattr(
+                hf_config,
+                "diffusion_stability_threshold",
+                DEFAULT_STABILITY_THRESHOLD,
+            ),
+        )
+        self._req_id_to_index: dict[str, int] = {}
+
+        # Persistent buffer for per-request causal flags, updated in-place
+        # so FULL CUDA graph replay sees the latest values.
+        self._causal_buf = torch.zeros(
+            self.max_num_reqs, dtype=torch.bool, device=device
+        )
+
+        # Persistent inputs_embeds buffer — required so FULL CUDA graph
+        # capture and runtime point at the SAME memory address.
+        # `prepare_dummy_inputs` (capture path) and `prepare_inputs` (runtime
+        # path) both must hand the captured graph a tensor at this address.
+        self._inputs_embeds_buf = torch.zeros(
+            self.max_num_tokens,
+            text_config.hidden_size,
+            dtype=self.model_config.dtype,
+            device=device,
+        )
+
+        self.canvas_arange = torch.arange(canvas_length, device=device)
+        self.decode_slots = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.decode_idx = UvaBackedTensor(self.max_num_reqs, dtype=torch.int64)
+
+    def get_supported_generation_tasks(self):
+        return ("generate",)
+
+    def custom_sampler(
+        self,
+        sampler: Any,
+        diffusion_config: Any,
+    ) -> tuple[Any, Any] | None:
+        hf_config = self.model_config.hf_config
+        return DiffusionSampler(
+            sampler=sampler,
+            diffusion_config=diffusion_config,
+            vocab_size=self.model_config.get_vocab_size(),
+            diffusion_states=self.diffusion_states,
+            t_min=getattr(hf_config, "diffusion_t_min", 0.4),
+            t_max=getattr(hf_config, "diffusion_t_max", 0.8),
+            sampler_type=getattr(hf_config, "diffusion_sampler", "ar_euler"),
+            entropy_bound=getattr(hf_config, "diffusion_entropy_bound", None),
+            confidence_threshold=getattr(
+                hf_config,
+                "diffusion_confidence_threshold",
+                DEFAULT_CONFIDENCE_THRESHOLD,
+            ),
+        ), None
+
+    def apply_staged_writes(self) -> None:
+        pass
+
+    def add_request(self, req_index: int, new_req_data: Any) -> None:
+        self._req_id_to_index[new_req_data.req_id] = req_index
+        self.diffusion_states.add_request(req_index)
+        if not new_req_data.req_id.startswith("_warmup_"):
+            prompt_len = len(new_req_data.prompt_token_ids)
+            self.diffusion_states.prompt_len[req_index] = prompt_len
+
+    def remove_request(self, req_id: str) -> None:
+        idx = self._req_id_to_index.pop(req_id, None)
+        if idx is not None:
+            self.diffusion_states.remove_request(idx)
+
+    def get_mm_embeddings(self, scheduled_encoder_inputs, input_batch):
+        return None
+
+    @torch.compile(dynamic=True)
+    def _apply_self_conditioning(
+        self,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        sc_probs: torch.Tensor,
+        is_encoder_phase: torch.Tensor,
+        canvas_arange: torch.Tensor,
+    ) -> None:
+        starts = query_start_loc[decode_idx]
+        token_indices = (canvas_arange + starts.unsqueeze(1)).reshape(-1)
+        probs = sc_probs[decode_slots]
+        probs = probs * (~is_encoder_phase[decode_slots]).unsqueeze(1).unsqueeze(2)
+        probs = probs.reshape(-1, probs.size(-1))
+        inputs_embeds[token_indices] = self.model.compute_self_conditioning(
+            inputs_embeds[token_indices], probs
+        )
+
+    def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
+        states = self.diffusion_states
+        num_tokens = input_batch.num_tokens
+        num_reqs = input_batch.num_reqs
+
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        input_ids = input_batch.input_ids[:num_tokens]
+
+        # Write into the PERSISTENT inputs_embeds buffer so FULL CUDA graph
+        # replay sees the latest values at the captured address. Always
+        # compute inputs_embeds (even prefill/warmup) so the compiled
+        # Gemma4Model.forward always sees the inputs_embeds branch.
+        num_tokens_padded = input_batch.num_tokens_after_padding
+        inputs_embeds = self._inputs_embeds_buf[:num_tokens_padded]
+        inputs_embeds[:num_tokens].copy_(self.model.embed_input_ids(input_ids))
+
+        # Apply self-conditioning ONLY for denoising decode requests in this
+        # batch. Pure prefill, warmup, profile runs (num_draft_tokens == 0 or
+        # empty state) skip the SC block entirely. Mixed prefill+decode falls
+        # through; the `decode_mask` below filters out prefill (n_per_req=0)
+        # and converged-this-step (`is_encoder_phase=True`) requests.
+        if input_batch.num_draft_tokens > 0 and self._req_id_to_index:
+            num_logits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+            is_decode_indices_np = np.where(num_logits_np > 0)[0]
+            num_decode = len(is_decode_indices_np)
+            self.decode_slots.np[:num_decode] = slots_np[is_decode_indices_np]
+            self.decode_slots.copy_to_uva()
+            self.decode_idx.np[:num_decode] = is_decode_indices_np
+            self.decode_idx.copy_to_uva()
+
+            self._apply_self_conditioning(
+                self.decode_slots.gpu[:num_decode],
+                self.decode_idx.gpu[:num_decode],
+                input_batch.query_start_loc,
+                inputs_embeds,
+                states.self_conditioning_probs,
+                states.is_encoder_phase,
+                self.canvas_arange,
+            )
+
+        return {"inputs_embeds": inputs_embeds}
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        # CUDA graph capture path — return a slice of the SAME persistent
+        # inputs_embeds buffer that `prepare_inputs` writes to at runtime,
+        # so the captured graph and runtime point to identical addresses.
+        return {"inputs_embeds": self._inputs_embeds_buf[:num_tokens]}
+
+    def postprocess_state(self, idx_mapping, num_sampled) -> None:
+        return None
+
+    def prepare_attn(
+        self,
+        input_batch,
+        cudagraph_mode,
+        block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        for_capture=False,
+    ) -> dict[str, Any]:
+        if cudagraph_mode == CUDAGraphMode.FULL:
+            num_reqs = input_batch.num_reqs_after_padding
+            num_tokens = input_batch.num_tokens_after_padding
+        else:
+            num_reqs = input_batch.num_reqs
+            num_tokens = input_batch.num_tokens
+
+        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+        max_query_len = input_batch.num_scheduled_tokens.max().item()
+
+        # Per-request causal mode: encoder (commit) = causal,
+        # denoise = bidirectional. Pass GPU tensor so the attention
+        # backend can handle mixed batches.
+        actual_num_reqs = input_batch.num_reqs
+        slots = input_batch.idx_mapping[:actual_num_reqs]
+        self._causal_buf[:actual_num_reqs] = self.diffusion_states.is_encoder_phase[
+            slots
+        ]
+        if actual_num_reqs < num_reqs:
+            self._causal_buf[actual_num_reqs:num_reqs] = False
+        causal: bool | torch.Tensor = self._causal_buf[:num_reqs]
+
+        return build_attn_metadata(
+            attn_groups=attn_groups,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            query_start_loc_gpu=input_batch.query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=max_query_len,
+            seq_lens=input_batch.seq_lens,
+            max_seq_len=self.max_model_len,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            kv_cache_config=kv_cache_config,
+            causal=causal,
+        )
+
+    num_sampled_tokens_per_step: int = 0
+
+
+class DiffusionSampler:
+    """Batched accept/renoise sampler for DiffusionGemma4.
+
+    Follows the same structure as ``vllm.v1.worker.gpu.sample.sampler.Sampler``:
+    decomposed into named methods, all GPU state in pre-allocated buffers,
+    no GPU→CPU syncs on the hot path.
+    """
+
+    def __init__(
+        self,
+        sampler: Any,
+        diffusion_config: Any,
+        vocab_size: int,
+        diffusion_states: DiffusionGemma4RequestStates | None = None,
+        renoise_ratio_modifier: float = 0.9,
+        ar_mask_noise_proportion: float = 0.0,
+        use_autoregressive_mask: bool = True,
+        confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+        t_min: float = 0.4,
+        t_max: float = 0.8,
+        sampler_type: str = "ar_euler",
+        entropy_bound: float | None = None,
+    ):
+        self.sampler = sampler
+        self.canvas_length = (
+            diffusion_config.canvas_length if diffusion_config is not None else 32
+        )
+        self.t_min = t_min
+        self.t_max = t_max
+        self.confidence_threshold = confidence_threshold
+        self.req_states = sampler.penalties_state.req_states
+        self.vocab_size = vocab_size
+        self.diffusion_states = diffusion_states
+        self.renoise_ratio_modifier = renoise_ratio_modifier
+        self.ar_mask_noise_proportion = ar_mask_noise_proportion
+        self.use_autoregressive_mask = use_autoregressive_mask
+        self.use_entropy_bound = sampler_type == "entropy_bound"
+        self.entropy_bound = entropy_bound
+        self.sampling_states = sampler.sampling_states
+        self.penalties_state = sampler.penalties_state
+
+        max_num_reqs = diffusion_states.max_num_reqs
+        device = diffusion_states.device
+        self._gumbel_temp = torch.zeros(
+            max_num_reqs, dtype=torch.float32, device=device
+        )
+        self._gumbel_seeds = torch.zeros(max_num_reqs, dtype=torch.long, device=device)
+        self._rng_counter = 0
+        self._sampled = torch.zeros(
+            max_num_reqs,
+            self.canvas_length,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._num_sampled = torch.zeros(
+            max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._eb_accepted_mask = torch.zeros(
+            max_num_reqs,
+            self.canvas_length,
+            dtype=torch.bool,
+            device=device,
+        )
+        self._decode_slots = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
+        self._decode_idx = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
+        self._query_lens = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+        self._num_logits = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+
+    def add_request(self, *args, **kwargs):
+        self.sampler.add_request(*args, **kwargs)
+
+    def apply_staged_writes(self):
+        self.sampler.apply_staged_writes()
+
+    # ------------------------------------------------------------------
+    # Prefill
+    # ------------------------------------------------------------------
+
+    def _handle_prefill(
+        self,
+        input_batch: Any,
+        device: torch.device,
+    ) -> SamplerOutput:
+        states = self.diffusion_states
+        num_reqs = input_batch.num_reqs
+        CL = self.canvas_length
+        slots = input_batch.idx_mapping[:num_reqs]
+        states.init_canvas(slots)
+        self.req_states.draft_tokens[slots, :CL] = states.canvas[slots]
+        states.is_encoder_phase.index_fill_(0, slots.long(), False)
+        sampled = self._sampled[:num_reqs, :1]
+        sampled.zero_()
+        num_sampled = self._num_sampled[:num_reqs]
+        num_sampled.zero_()
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_sampled,
+        )
+
+    # ------------------------------------------------------------------
+    # Decode helpers
+    # ------------------------------------------------------------------
+
+    def _get_decode_requests(
+        self,
+        input_batch: Any,
+        device: torch.device,
+    ) -> tuple[np.ndarray, np.ndarray, torch.Tensor, torch.Tensor, int]:
+        """Split batch into decode vs prefill, init canvas for new prefills."""
+        states = self.diffusion_states
+        CL = self.canvas_length
+        num_reqs = input_batch.num_reqs
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        decode_slots_np = slots_np[decode_indices_np]
+
+        if len(prefill_indices_np) > 0:
+            ps = slots_np[prefill_indices_np]
+            states.init_canvas(ps)
+            self.req_states.draft_tokens[ps, :CL] = states.canvas[ps]
+            ps_gpu = torch.from_numpy(ps.astype(np.int64)).to(
+                states.is_encoder_phase.device
+            )
+            states.is_encoder_phase.index_fill_(0, ps_gpu, False)
+
+        num_decode = len(decode_indices_np)
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+        return per_req_nlogits_np, decode_slots_np, decode_slots, decode_idx, num_decode
+
+    def _compute_temperature(self, decode_slots: torch.Tensor) -> torch.Tensor:
+        """Linear temperature schedule matching HF's LogitsProcessor."""
+        states = self.diffusion_states
+        steps = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps).clamp(min=1.0)
+        return self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+
+    def _sample_tokens(
+        self,
+        logits: torch.Tensor,
+        decode_slots: torch.Tensor,
+        num_decode: int,
+        temp: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gumbel-max sample + argmax from temperature-scaled logits."""
+        CL = self.canvas_length
+        flat_logits = logits.reshape(num_decode * CL, -1)
+        expanded_idx = decode_slots.repeat_interleave(CL)
+
+        self._gumbel_temp[decode_slots] = temp
+        self._rng_counter += 1
+        self._gumbel_seeds.index_fill_(0, decode_slots, self._rng_counter)
+        pos = torch.arange(CL, device=device).repeat(num_decode)
+
+        apply_temperature(flat_logits, expanded_idx, self._gumbel_temp)
+        new_tokens = gumbel_sample(
+            flat_logits,
+            expanded_idx,
+            self._gumbel_temp,
+            self._gumbel_seeds,
+            pos,
+            apply_temperature=False,
+        ).reshape(num_decode, CL)
+        argmax_tokens = flat_logits.argmax(dim=-1).reshape(num_decode, CL)
+        return flat_logits, new_tokens, argmax_tokens
+
+    def _compute_probs_and_confidence(
+        self,
+        flat_logits: torch.Tensor,
+        decode_slots: torch.Tensor,
+        num_decode: int,
+    ) -> None:
+        """Compute probs for self-conditioning and confidence from entropy."""
+        states = self.diffusion_states
+        CL = self.canvas_length
+
+        log_probs = flat_logits.reshape(num_decode, CL, -1).float().log_softmax(dim=-1)
+        probs = log_probs.exp()
+        sc_vocab = states.self_conditioning_probs.shape[-1]
+        if probs.shape[-1] < sc_vocab:
+            probs = F.pad(probs, (0, sc_vocab - probs.shape[-1]))
+        states.self_conditioning_probs[decode_slots] = probs.to(
+            states.self_conditioning_probs.dtype
+        )
+
+        token_entropy = -(probs * log_probs).sum(dim=-1)
+        mean_entropy = token_entropy.mean(dim=-1)
+        states.confident[decode_slots] = mean_entropy < self.confidence_threshold
+
+        if self.use_entropy_bound:
+            self._compute_entropy_bound_mask(token_entropy, num_decode)
+
+    def _compute_entropy_bound_mask(
+        self,
+        token_entropy: torch.Tensor,
+        num_decode: int,
+    ) -> None:
+        """Compute acceptance mask for EntropyBound sampler."""
+        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1, descending=False)
+        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+        sorted_mask = (cumsum_ent - cummax_ent) <= self.entropy_bound
+        eb_accepted = torch.zeros_like(sorted_mask)
+        eb_accepted.scatter_(dim=-1, index=sorted_idx, src=sorted_mask)
+        self._eb_accepted_mask[:num_decode] = eb_accepted
+
+    def _run_post_sample_kernel(
+        self,
+        new_tokens: torch.Tensor,
+        argmax_tokens: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        num_decode: int,
+    ) -> None:
+        """Run the fused commit/denoise/convergence Triton kernel."""
+        states = self.diffusion_states
+        CL = self.canvas_length
+        _diffusion_post_sample_kernel[(num_decode,)](
+            new_tokens,
+            argmax_tokens,
+            states.canvas,
+            states.argmax_canvas,
+            states.step,
+            states.is_encoder_phase,
+            states.confident,
+            states.accepted_canvas_history,
+            states.accepted_canvas_history_len,
+            states.self_conditioning_probs,
+            sampled,
+            num_sampled,
+            decode_slots,
+            decode_idx,
+            self._eb_accepted_mask,
+            states.canvas.stride(0),
+            states.argmax_canvas.stride(0),
+            states.accepted_canvas_history.stride(0),
+            states.accepted_canvas_history.stride(1),
+            states.self_conditioning_probs.stride(0),
+            states.self_conditioning_probs.stride(1),
+            sampled.stride(0),
+            self._eb_accepted_mask.stride(0),
+            states.max_denoising_steps,
+            self.renoise_ratio_modifier,
+            self.ar_mask_noise_proportion,
+            self.use_autoregressive_mask,
+            self.vocab_size,
+            self._rng_counter,
+            CANVAS_LEN=CL,
+            ST=states.stability_threshold,
+            BLOCK_SIZE=triton.next_power_of_2(CL),
+            VOCAB_BLOCK=min(triton.next_power_of_2(self.vocab_size), 4096),
+            USE_ENTROPY_BOUND=self.use_entropy_bound,
+        )
+
+    def _handle_convergence(self, decode_slots: torch.Tensor) -> None:
+        """Copy argmax_canvas → canvas for converged slots (no CPU sync)."""
+        states = self.diffusion_states
+        converged = states.is_encoder_phase[decode_slots].unsqueeze(1)
+        states.canvas[decode_slots] = torch.where(
+            converged,
+            states.argmax_canvas[decode_slots],
+            states.canvas[decode_slots],
+        )
+
+    def _build_output(
+        self,
+        input_batch: Any,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        per_req_nlogits_np: np.ndarray,
+        device: torch.device,
+    ) -> SamplerOutput:
+        """Copy draft tokens and compute num_rejected."""
+        CL = self.canvas_length
+        num_reqs = input_batch.num_reqs
+        slots_gpu = input_batch.idx_mapping[:num_reqs]
+        states = self.diffusion_states
+        self.req_states.draft_tokens[slots_gpu, :CL] = states.canvas[slots_gpu]
+
+        self._query_lens.np[:num_reqs] = np.diff(
+            input_batch.query_start_loc_np[: num_reqs + 1]
+        )
+        self._num_logits.np[:num_reqs] = per_req_nlogits_np
+        self._query_lens.copy_to_uva()
+        self._num_logits.copy_to_uva()
+
+        num_rejected = _compute_num_rejected(
+            self._num_logits.gpu[:num_reqs],
+            num_sampled,
+            input_batch.query_start_loc[: num_reqs + 1],
+        )
+
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: Any,
+        draft_logits: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        num_reqs = input_batch.num_reqs
+        device = logits.device
+
+        if input_batch.num_draft_tokens == 0:
+            return self._handle_prefill(input_batch, device)
+
+        per_req_nlogits_np, decode_slots_np, decode_slots, decode_idx, num_decode = (
+            self._get_decode_requests(input_batch, device)
+        )
+
+        temp = self._compute_temperature(decode_slots)
+        flat_logits, new_tokens, argmax_tokens = self._sample_tokens(
+            logits,
+            decode_slots,
+            num_decode,
+            temp,
+            device,
+        )
+        self._compute_probs_and_confidence(flat_logits, decode_slots, num_decode)
+
+        sampled = self._sampled[:num_reqs]
+        sampled.zero_()
+        num_sampled = self._num_sampled[:num_reqs]
+        num_sampled.zero_()
+
+        self._run_post_sample_kernel(
+            new_tokens,
+            argmax_tokens,
+            sampled,
+            num_sampled,
+            decode_slots,
+            decode_idx,
+            num_decode,
+        )
+        self._handle_convergence(decode_slots)
+
+        return self._build_output(
+            input_batch,
+            sampled,
+            num_sampled,
+            per_req_nlogits_np,
+            device,
+        )

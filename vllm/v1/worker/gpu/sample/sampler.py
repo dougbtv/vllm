@@ -44,6 +44,7 @@ class Sampler:
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
         self.use_fp64_gumbel = use_fp64_gumbel
 
+        self.req_states = req_states
         self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
         self.penalties_state = PenaltiesState(req_states)
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
@@ -118,6 +119,19 @@ class Sampler:
         else:
             logprobs_tensors = None
 
+        # Base sampler: 1 token per request normally, 0 for chunked prefill
+        # (where seq_len < prefill_len means the request isn't fully prefilled
+        # yet and we shouldn't record an output token). num_rejected is always
+        # 0 here — for non-chunked-prefill `num_logits - num_sampled = 1 - 1 = 0`;
+        # for chunked prefill both clamp to 0.
+        prefill_len = self.req_states.prefill_len.gpu[input_batch.idx_mapping]
+        is_chunked_prefill = input_batch.seq_lens < prefill_len
+        num_sampled = input_batch.seq_lens.new_ones(input_batch.num_reqs)
+        num_sampled = torch.where(
+            is_chunked_prefill, torch.zeros_like(num_sampled), num_sampled
+        )
+        num_rejected = torch.zeros_like(num_sampled)
+
         # These are GPU tensors.
         sampler_output = SamplerOutput(
             # The sampled tokens are expanded to 2D tensor with shape
@@ -126,7 +140,8 @@ class Sampler:
             sampled_token_ids=sampled.view(-1, 1),
             logprobs_tensors=logprobs_tensors,
             num_nans=num_nans,
-            num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
         )
         return sampler_output
 
