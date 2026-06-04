@@ -35,6 +35,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.gemma4 import (
     Gemma4Model,
 )
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
@@ -86,6 +87,21 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
     set by DiffusionGemma4ModelState.prepare_inputs().
     """
 
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.decoder.": "model.",
+            "model.encoder.language_model.": "model.",
+        },
+        orig_to_new_substr={
+            ".experts.": ".moe.experts.",
+        },
+    )
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     @staticmethod
     def get_model_state_cls():
         return DiffusionGemma4ModelState
@@ -108,10 +124,17 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
         # v_proj weights for full-attention layers; without this flag they
         # would silently load with random V projections.
         text_config.attention_k_eq_v = True
+        from vllm.model_executor.models.utils import maybe_prefix
 
+        # Use maybe_prefix to ensure correct weight name prefixes for quantization.
+        # The quantization config uses hf_to_vllm_mapper to match checkpoint weight
+        # names to model parameter names. If prefix="", using f"{prefix}.model" would
+        # create ".model" (invalid), but maybe_prefix returns "model". This ensures
+        # the mapper correctly transforms "model.decoder.layers.0.weight" ->
+        # "model.layers.0.weight" for quantized weight loading.
         self.model = Gemma4Model(
             vllm_config=vllm_config,
-            prefix=f"{prefix}.model",
+            prefix=maybe_prefix(prefix, "model"),
         )
 
         self.lm_head = ParallelLMHead(
@@ -205,7 +228,13 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
         )
 
         def _remap_weights():
-            seen_layers: set[str] = set()
+            # Use full weight names (including suffixes like .weight_scale, .weight_packed)
+            # for deduplication instead of just the base layer name. This is critical for
+            # quantized checkpoints where each weight has multiple associated tensors
+            # (weight, weight_scale, weight_global_scale, input_global_scale). If we only
+            # track base layer names, all the scales would be incorrectly skipped as
+            # duplicates, causing the model to produce garbage output.
+            seen_weights: set[str] = set()
             for name, weight in weights:
                 # Self-conditioning lives under model.decoder.self_conditioning.*
                 # in the checkpoint but at self_conditioning.* in our model.
@@ -218,13 +247,14 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
                 # Encoder backbone → model.*
                 if name.startswith("model.encoder.language_model."):
                     name = name.replace("model.encoder.language_model.", "model.")
-                # Decoder backbone → model.* (skip duplicates)
+                # Decoder backbone → model.* (skip exact duplicates)
                 elif name.startswith("model.decoder."):
                     name = name.replace("model.decoder.", "model.")
-                    layer_key = name.split(".weight")[0].split(".bias")[0]
-                    if layer_key in seen_layers:
-                        continue
-                seen_layers.add(name.split(".weight")[0].split(".bias")[0])
+
+                # Skip only if we've seen the exact same weight name (including scales)
+                if name in seen_weights:
+                    continue
+                seen_weights.add(name)
                 yield name, weight
 
         # Delegate to Gemma4ForCausalLM.load_weights for the backbone,
