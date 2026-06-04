@@ -96,6 +96,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     ops_colqwen3="OpsColQwen3Config",
     qwen3_vl_nemotron_embed="Qwen3VLNemotronEmbedConfig",
     cosmos3_omni="Cosmos3Config",
+    diffusion_gemma="DiffusionGemmaConfig",
+    # TODO(diffusion): remove once checkpoints finalize to RC0.1 "diffusion_gemma".
     diffusion_gemma4="DiffusionGemma4Config",
     deepseek_vl_v2="DeepseekVLV2Config",
     deepseek_v32="DeepseekV3Config",

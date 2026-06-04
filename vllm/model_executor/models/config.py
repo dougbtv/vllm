@@ -698,6 +698,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColQwen3_5": Qwen3_5ForConditionalGenerationConfig,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
+    "DiffusionGemmaForBlockDiffusion": DiffusionGemma4ModelForBlockDiffusionConfig,  # noqa: E501
+    # TODO(diffusion): remove once checkpoints finalize to RC0.1 naming.
     "DiffusionGemma4ModelForBlockDiffusion": DiffusionGemma4ModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
