@@ -83,10 +83,12 @@ def prepare_humming_layer(layer: LinearBase, quant_config: dict):
     weight_schema = BaseWeightSchema.from_config(quant_config)
     input_schema = HummingInputSchema()
 
-    # ReplicatedLinear has no TP partitioning and so does not set
-    # input_size_per_partition; for it that is just input_size.
+    # ReplicatedLinear / ParallelLMHead may lack input_size_per_partition
+    # and input_size; fall back to embedding_dim for embedding-based layers.
     input_size_per_partition = getattr(
-        layer, "input_size_per_partition", layer.input_size
+        layer, "input_size_per_partition",
+        getattr(layer, "input_size",
+                getattr(layer, "embedding_dim", None))
     )
     shape_k_stacks = [input_size_per_partition]
     shape_n_stacks = layer.output_partition_sizes
