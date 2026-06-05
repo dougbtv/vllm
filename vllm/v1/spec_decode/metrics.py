@@ -140,24 +140,29 @@ class SpecDecodingLogging:
         num_committed_tokens: int,
         committed_throughput: float,
     ):
-        # In the diffusion path, each "draft" is one denoising step over a
-        # canvas block: ``num_canvas_tokens`` positions are (re)evaluated and
-        # ``num_committed_tokens`` of them are finalized this interval. The
-        # spec-decode bonus token and per-position vector do not apply.
+        # Each "draft" is one denoising step that re-evaluates the canvas block
+        # and finalizes some of its positions.
         mean_committed_per_step = (
             num_committed_tokens / num_denoising_steps
             if num_denoising_steps > 0
+            else float("nan")
+        )
+        mean_steps_per_canvas = (
+            num_canvas_tokens / num_committed_tokens
+            if num_committed_tokens > 0
             else float("nan")
         )
 
         log_fn(
             "DiffusionDecoding metrics: "
             "Committed token throughput: %.2f tokens/s, "
+            "Mean denoising steps per canvas: %.2f, "
             "Mean tokens committed per denoising step: %.2f, "
             "Committed: %d tokens, "
             "Denoising steps: %d, "
             "Canvas positions evaluated: %d",
             committed_throughput,
+            mean_steps_per_canvas,
             mean_committed_per_step,
             num_committed_tokens,
             num_denoising_steps,
