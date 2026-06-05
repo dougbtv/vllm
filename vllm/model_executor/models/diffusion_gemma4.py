@@ -800,7 +800,7 @@ class DiffusionGemma4ModelState(ModelState):
             causal=causal,
         )
 
-    num_sampled_tokens_per_step: int = 0
+    num_new_sampled_tokens_per_step: int = 0
 
 
 class DiffusionSampler:

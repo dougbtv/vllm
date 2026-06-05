@@ -110,6 +110,6 @@ class ModelState(ABC):
         """
         return None
 
-    num_sampled_tokens_per_step: int = 1
-    """Tokens sampled (not drafted) each decode step.
-    Standard AR = 1, diffusion = 0 (canvas-only)."""
+    num_new_sampled_tokens_per_step: int = 1
+    """New tokens sampled on each decode step 
+    (excluding accepted draft tokens, a.k.a num bonus tokens)."""

@@ -227,7 +227,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Samplers and decode_query_len created in load_model() after
-        # model_state exists (num_sampled_tokens_per_step from ModelState).
+        # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
@@ -304,9 +304,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
 
-        self.num_sampled_tokens_per_step = self.model_state.num_sampled_tokens_per_step
+        self.num_new_sampled_tokens_per_step = (
+            self.model_state.num_new_sampled_tokens_per_step
+        )
         self.decode_query_len = (
-            self.num_speculative_steps + self.num_sampled_tokens_per_step
+            self.num_speculative_steps + self.num_new_sampled_tokens_per_step
         )
 
         # Initialize samplers. Model states may override via custom_sampler().
@@ -864,7 +866,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=np.int32,
                 count=num_reqs,
             )
-            num_bonus_tokens = self.model_state.num_sampled_tokens_per_step
+            num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
             num_logits = num_draft_tokens_per_req + num_bonus_tokens
@@ -942,7 +944,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens,
             cu_num_logits,
             total_num_logits,
-            num_sampled=self.model_state.num_sampled_tokens_per_step,
+            self.model_state.num_new_sampled_tokens_per_step,
         )
 
         # CPU upper bound on seq_lens; padded entries left at zero.

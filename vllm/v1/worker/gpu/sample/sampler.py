@@ -12,7 +12,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     flashinfer_sample,
     flashinfer_sampler_supported,
 )
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -119,18 +119,16 @@ class Sampler:
         else:
             logprobs_tensors = None
 
-        # Base sampler: 1 token per request normally, 0 for chunked prefill
-        # (where seq_len < prefill_len means the request isn't fully prefilled
-        # yet and we shouldn't record an output token). num_rejected is always
-        # 0 here — for non-chunked-prefill `num_logits - num_sampled = 1 - 1 = 0`;
-        # for chunked prefill both clamp to 0.
-        prefill_len = self.req_states.prefill_len.gpu[input_batch.idx_mapping]
-        is_chunked_prefill = input_batch.seq_lens < prefill_len
-        num_sampled = input_batch.seq_lens.new_ones(input_batch.num_reqs)
-        num_sampled = torch.where(
-            is_chunked_prefill, torch.zeros_like(num_sampled), num_sampled
+        # 1 sampled token per request, except chunked-prefill requests
+        # (seq_len < prefill_len) which aren't done prefilling and produce no
+        # output token. num_rejected is always 0 here (one logit per request).
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
         )
-        num_rejected = torch.zeros_like(num_sampled)
 
         # These are GPU tensors.
         sampler_output = SamplerOutput(
