@@ -53,7 +53,11 @@ class SpecDecodingLogging:
     before resetting to zero.
     """
 
-    def __init__(self):
+    def __init__(self, is_diffusion: bool = False):
+        # Diffusion (dLLM) models reuse the spec-decode data path with
+        # overloaded semantics, so the raw spec-decode framing (drafts, bonus
+        # token, per-position vector) is logged with diffusion-native terms.
+        self.is_diffusion = is_diffusion
         self.reset()
 
     def reset(self):
@@ -84,6 +88,17 @@ class SpecDecodingLogging:
         if elapsed_time > 0:
             draft_throughput = num_draft_tokens / elapsed_time
             accepted_throughput = num_accepted_tokens / elapsed_time
+
+        if self.is_diffusion:
+            self._log_diffusion(
+                log_fn,
+                num_denoising_steps=num_drafts,
+                num_canvas_tokens=num_draft_tokens,
+                num_committed_tokens=num_accepted_tokens,
+                committed_throughput=accepted_throughput,
+            )
+            self.reset()
+            return
 
         draft_acceptance_rate = (
             num_accepted_tokens / num_draft_tokens * 100
@@ -116,6 +131,38 @@ class SpecDecodingLogging:
             draft_acceptance_rate,
         )
         self.reset()
+
+    def _log_diffusion(
+        self,
+        log_fn,
+        num_denoising_steps: int,
+        num_canvas_tokens: int,
+        num_committed_tokens: int,
+        committed_throughput: float,
+    ):
+        # In the diffusion path, each "draft" is one denoising step over a
+        # canvas block: ``num_canvas_tokens`` positions are (re)evaluated and
+        # ``num_committed_tokens`` of them are finalized this interval. The
+        # spec-decode bonus token and per-position vector do not apply.
+        mean_committed_per_step = (
+            num_committed_tokens / num_denoising_steps
+            if num_denoising_steps > 0
+            else float("nan")
+        )
+
+        log_fn(
+            "DiffusionDecoding metrics: "
+            "Committed token throughput: %.2f tokens/s, "
+            "Mean tokens committed per denoising step: %.2f, "
+            "Committed: %d tokens, "
+            "Denoising steps: %d, "
+            "Canvas positions evaluated: %d",
+            committed_throughput,
+            mean_committed_per_step,
+            num_committed_tokens,
+            num_denoising_steps,
+            num_canvas_tokens,
+        )
 
 
 class SpecDecodingProm:
