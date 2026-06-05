@@ -36,11 +36,9 @@ from vllm.model_executor.models.gemma4 import (
     Gemma4Model,
 )
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 logger = init_logger(__name__)
@@ -287,6 +285,195 @@ def _compute_num_rejected(
     return torch.where(is_denoise, query_lens, num_rejected)
 
 
+@torch.compile(dynamic=True)
+def _compiled_sample_step(
+    # Logits from the model [num_decode * CL, vocab]
+    logits: torch.Tensor,
+    # Request mapping
+    decode_slots: torch.Tensor,     # [num_decode] int64 → slot indices
+    decode_idx: torch.Tensor,       # [num_decode] int64 → position in num_reqs
+    all_slots: torch.Tensor,        # [num_reqs] int64 → all slot indices
+    # State tensors (modified in-place)
+    canvas: torch.Tensor,           # [max_num_reqs, CL]
+    argmax_canvas: torch.Tensor,    # [max_num_reqs, CL]
+    step_tensor: torch.Tensor,      # [max_num_reqs]
+    is_encoder_phase: torch.Tensor, # [max_num_reqs]
+    confident_tensor: torch.Tensor, # [max_num_reqs]
+    sc_probs: torch.Tensor,         # [max_num_reqs, CL, vocab]
+    history: torch.Tensor,          # [max_num_reqs, ST, CL]
+    history_len_tensor: torch.Tensor,  # [max_num_reqs]
+    # Output tensors (modified in-place)
+    sampled: torch.Tensor,          # [num_reqs, CL]
+    num_sampled: torch.Tensor,      # [num_reqs]
+    draft_tokens: torch.Tensor,     # [max_num_reqs, >=CL]
+    # Scalar config
+    max_denoising_steps: float,
+    t_min: float,
+    t_max: float,
+    confidence_threshold: float,
+    vocab_size: int,
+    CL: int,
+    ST: int,
+    # Sampler mode
+    use_entropy_bound: bool,
+    entropy_bound: float,
+    renoise_ratio_modifier: float,
+    ar_mask_noise_proportion: float,
+    use_autoregressive_mask: bool,
+) -> None:
+    """Compiled decode step: temperature → Gumbel sample → probs/confidence →
+    accept/renoise → convergence, all as vectorized PyTorch ops."""
+    num_decode = decode_slots.shape[0]
+    device = decode_slots.device
+
+    # ---- Phase 1: Temperature schedule ----
+    steps_f = step_tensor[decode_slots].float()
+    remaining = (max_denoising_steps - steps_f).clamp(min=1.0)
+    temp = t_min + (t_max - t_min) * (remaining / max_denoising_steps)
+
+    # ---- Phase 2: Temperature scaling + Gumbel-max sampling ----
+    logits_3d = logits.reshape(num_decode, CL, -1).float()
+    scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
+
+    # Gumbel-max trick: argmax(logits/T + Gumbel) ~ sample from softmax(logits/T)
+    u = torch.rand_like(scaled).clamp(min=1e-20)
+    gumbel = -torch.log(-torch.log(u))
+    # Zero noise when temp==0 (greedy)
+    noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
+    new_tokens = noisy.view(-1, noisy.shape[-1]).argmax(dim=-1).view(num_decode, CL)
+    argmax_tokens = scaled.view(-1, scaled.shape[-1]).argmax(dim=-1).view(
+        num_decode, CL
+    )
+
+    # ---- Phase 3: Probs, self-conditioning, confidence ----
+    log_probs = scaled.log_softmax(dim=-1)
+    probs = log_probs.exp()
+
+    token_entropy = -(probs * log_probs).sum(dim=-1)   # [num_decode, CL]
+    mean_entropy = token_entropy.mean(dim=-1)           # [num_decode]
+    confident_tensor[decode_slots] = mean_entropy < confidence_threshold
+
+    # ---- Phase 4: Entropy-bound acceptance mask (if enabled) ----
+    if use_entropy_bound:
+        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
+        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+        sorted_mask = (cumsum_ent - cummax_ent) <= entropy_bound
+        eb_mask = torch.zeros_like(sorted_mask)
+        eb_mask.scatter_(1, sorted_idx, sorted_mask)
+
+    # ---- Phase 5: Post-sample ----
+    is_commit = is_encoder_phase[decode_slots]          # [num_decode]
+    is_denoise = ~is_commit
+    cur_step = step_tensor[decode_slots].float()
+
+    # Step update: +1 for denoise, reset to 0 for commit
+    new_step_val = torch.where(
+        is_denoise,
+        (cur_step + 1).to(step_tensor.dtype),
+        step_tensor.new_zeros(num_decode),
+    )
+    step_tensor[decode_slots] = new_step_val
+
+    # Random tokens for renoise / canvas reinit
+    random_tokens = torch.randint(
+        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
+    )
+
+    # Compute denoise canvas (accept/renoise)
+    if use_entropy_bound:
+        denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
+    else:
+        remaining_d = (max_denoising_steps - cur_step).clamp(min=1.0)
+        accept_prob = (1.0 / remaining_d).unsqueeze(1)     # [num_decode, 1]
+        renoise_prob = (
+            renoise_ratio_modifier
+            * (remaining_d - 1.0).clamp(min=0.0)
+            / max_denoising_steps
+        ).unsqueeze(1)
+
+        cur_canvas = canvas[decode_slots]
+        accept_mask = torch.rand(num_decode, CL, device=device) < accept_prob
+
+        if use_autoregressive_mask:
+            ar_thresh = ((cur_step + 1.0) / max_denoising_steps).unsqueeze(1)
+            pos_ratio = (
+                torch.arange(CL, device=device).float()
+                * (1.0 - ar_mask_noise_proportion)
+                / max(CL - 1, 1)
+            )
+            accept_mask = accept_mask | (pos_ratio.unsqueeze(0) <= ar_thresh)
+
+        accepted = torch.where(accept_mask, new_tokens, cur_canvas)
+        denoise_canvas = torch.where(
+            torch.rand(num_decode, CL, device=device) < renoise_prob,
+            random_tokens,
+            accepted,
+        )
+
+    # Canvas: commit → random reinit, denoise → accept/renoise result
+    canvas[decode_slots] = torch.where(
+        is_commit.unsqueeze(1), random_tokens, denoise_canvas
+    )
+
+    # History: write argmax_tokens for denoise requests at circular position
+    hist_len = history_len_tensor[decode_slots]
+    write_pos = hist_len % ST
+    for i in range(ST):
+        write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
+        history[decode_slots, i] = torch.where(
+            write_here, argmax_tokens, history[decode_slots, i]
+        )
+
+    # Argmax canvas: update for denoise, preserve for commit
+    argmax_canvas[decode_slots] = torch.where(
+        is_denoise.unsqueeze(1), argmax_tokens, argmax_canvas[decode_slots]
+    )
+
+    # History length: increment for denoise, reset for commit
+    new_hist_len = torch.where(
+        is_denoise, hist_len + 1, hist_len.new_zeros(num_decode)
+    )
+    history_len_tensor[decode_slots] = new_hist_len
+
+    # SC probs: store for denoise, zero for commit
+    sc_probs[decode_slots] = probs.to(sc_probs.dtype) * is_denoise[
+        :, None, None
+    ].to(sc_probs.dtype)
+
+    # Sampled output: commit → emit argmax_canvas, denoise → 0 (pre-zeroed)
+    sampled[decode_idx] = (
+        argmax_canvas[decode_slots].to(sampled.dtype)
+        * is_commit.unsqueeze(1).to(sampled.dtype)
+    )
+    num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * CL
+
+    # ---- Phase 6: Stability + convergence ----
+    ref = history[decode_slots, 0]
+    mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
+    for h in range(1, ST):
+        mismatch = mismatch + (ref != history[decode_slots, h]).sum(dim=-1).int()
+    stable = mismatch == 0
+
+    step_after = step_tensor[decode_slots]
+    converged = (stable & confident_tensor[decode_slots] & (new_hist_len >= ST)) | (
+        step_after >= max_denoising_steps
+    )
+    # Commit done → denoise next (False); denoise converged → commit next (True)
+    is_encoder_phase[decode_slots] = torch.where(
+        is_commit, is_commit.new_zeros(num_decode), converged
+    )
+
+    # Overwrite canvas with argmax for newly converged denoise requests
+    newly_converged = (converged & is_denoise).unsqueeze(1)
+    canvas[decode_slots] = torch.where(
+        newly_converged, argmax_canvas[decode_slots], canvas[decode_slots]
+    )
+
+    # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
+    draft_tokens[all_slots, :CL] = canvas[all_slots]
+
+
 class DiffusionGemma4RequestStates:
     """Pre-allocated GPU tensors for DiffusionGemma4 per-request state.
 
@@ -381,194 +568,6 @@ class DiffusionGemma4RequestStates:
         self.is_encoder_phase[slot_idx] = False
         self.accepted_canvas_history_len[slot_idx] = 0
         self.self_conditioning_probs[slot_idx] = 0
-
-
-@triton.jit
-def _diffusion_post_sample_kernel(
-    new_tokens_ptr,
-    argmax_tokens_ptr,
-    canvas_ptr,
-    argmax_canvas_ptr,
-    step_ptr,
-    is_encoder_ptr,
-    confident_ptr,
-    history_ptr,
-    history_len_ptr,
-    sc_probs_ptr,
-    sampled_ptr,
-    num_sampled_ptr,
-    decode_slots_ptr,
-    decode_idx_ptr,
-    accepted_mask_ptr,
-    canvas_stride,
-    argmax_canvas_stride,
-    history_stride_req,
-    history_stride_step,
-    sc_probs_stride_req,
-    sc_probs_stride_pos,
-    sampled_stride,
-    accepted_mask_stride,
-    max_steps,
-    renoise_ratio_modifier: tl.constexpr,
-    ar_mask_noise_proportion: tl.constexpr,
-    use_autoregressive_mask: tl.constexpr,
-    vocab_size,
-    seed,
-    CANVAS_LEN: tl.constexpr,
-    ST: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    VOCAB_BLOCK: tl.constexpr,
-    USE_ENTROPY_BOUND: tl.constexpr = False,
-):
-    """Fused commit/denoise/convergence for one decode request."""
-    req_local = tl.program_id(0)
-    slot = tl.load(decode_slots_ptr + req_local)
-    batch_idx = tl.load(decode_idx_ptr + req_local)
-    is_enc = tl.load(is_encoder_ptr + slot)
-
-    if is_enc:
-        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
-            offsets = start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < CANVAS_LEN
-            best_tok = tl.load(
-                argmax_canvas_ptr + slot * argmax_canvas_stride + offsets,
-                mask=mask,
-            )
-            tl.store(
-                sampled_ptr + batch_idx * sampled_stride + offsets,
-                best_tok.to(tl.int32),
-                mask=mask,
-            )
-            random_tok = (
-                tl.rand(seed + 2, slot * CANVAS_LEN + offsets) * vocab_size
-            ).to(tl.int64)
-            tl.store(
-                canvas_ptr + slot * canvas_stride + offsets,
-                random_tok,
-                mask=mask,
-            )
-        for pos in range(CANVAS_LEN):
-            base = slot * sc_probs_stride_req + pos * sc_probs_stride_pos
-            for vstart in range(0, vocab_size, VOCAB_BLOCK):
-                voffs = vstart + tl.arange(0, VOCAB_BLOCK)
-                vmask = voffs < vocab_size
-                tl.store(sc_probs_ptr + base + voffs, 0.0, mask=vmask)
-        tl.store(num_sampled_ptr + batch_idx, CANVAS_LEN)
-        tl.store(step_ptr + slot, 0)
-        tl.store(is_encoder_ptr + slot, 0)
-        tl.store(history_len_ptr + slot, 0)
-    else:
-        step = tl.load(step_ptr + slot).to(tl.float32)
-        tl.store(step_ptr + slot, (step + 1.0).to(tl.int32))
-        if not USE_ENTROPY_BOUND:
-            remaining = tl.maximum(max_steps - step, 1.0)
-            accept_prob = 1.0 / remaining
-            renoise_prob = (
-                renoise_ratio_modifier * tl.maximum(remaining - 1.0, 0.0) / max_steps
-            )
-            ar_threshold = (step + 1.0) / max_steps
-
-        hist_len = tl.load(history_len_ptr + slot)
-        write_pos = hist_len % ST
-
-        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
-            offsets = start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < CANVAS_LEN
-            new_tok = tl.load(
-                new_tokens_ptr + req_local * CANVAS_LEN + offsets,
-                mask=mask,
-            )
-            argmax_tok = tl.load(
-                argmax_tokens_ptr + req_local * CANVAS_LEN + offsets,
-                mask=mask,
-            )
-            tl.store(
-                history_ptr
-                + slot * history_stride_req
-                + write_pos * history_stride_step
-                + offsets,
-                argmax_tok,
-                mask=mask,
-            )
-            tl.store(
-                argmax_canvas_ptr + slot * argmax_canvas_stride + offsets,
-                argmax_tok,
-                mask=mask,
-            )
-            random_tok = (
-                tl.rand(seed + 1, req_local * CANVAS_LEN + offsets) * vocab_size
-            ).to(tl.int64)
-
-            if USE_ENTROPY_BOUND:
-                eb_mask = tl.load(
-                    accepted_mask_ptr + req_local * accepted_mask_stride + offsets,
-                    mask=mask,
-                ).to(tl.int1)
-                tok = tl.where(eb_mask, new_tok, random_tok)
-            else:
-                cur_tok = tl.load(
-                    canvas_ptr + slot * canvas_stride + offsets,
-                    mask=mask,
-                )
-                r_accept = tl.rand(
-                    seed,
-                    req_local * CANVAS_LEN * 2 + offsets * 2,
-                )
-                accept_mask = r_accept < accept_prob
-                if use_autoregressive_mask:
-                    canvas_proportion = (
-                        offsets.to(tl.float32)
-                        * (1.0 - ar_mask_noise_proportion)
-                        / (CANVAS_LEN - 1)
-                    )
-                    accept_mask = accept_mask | (canvas_proportion <= ar_threshold)
-                accepted = tl.where(accept_mask, new_tok, cur_tok)
-                r_renoise = tl.rand(
-                    seed,
-                    req_local * CANVAS_LEN * 2 + offsets * 2 + 1,
-                )
-                tok = tl.where(r_renoise < renoise_prob, random_tok, accepted)
-
-            tl.store(
-                canvas_ptr + slot * canvas_stride + offsets,
-                tok,
-                mask=mask,
-            )
-
-        new_hist_len = hist_len + 1
-        tl.store(history_len_ptr + slot, new_hist_len)
-
-        any_mismatch = 0
-        for start in range(0, CANVAS_LEN, BLOCK_SIZE):
-            offsets = start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < CANVAS_LEN
-            ref = tl.load(
-                history_ptr + slot * history_stride_req + offsets,
-                mask=mask,
-                other=-1,
-            )
-            for h in range(1, ST):
-                h_tok = tl.load(
-                    history_ptr
-                    + slot * history_stride_req
-                    + h * history_stride_step
-                    + offsets,
-                    mask=mask,
-                    other=-2,
-                )
-                any_mismatch += tl.sum(
-                    tl.where(mask, (ref != h_tok).to(tl.int32), 0),
-                    axis=0,
-                )
-
-        stable = any_mismatch == 0
-        confident = tl.load(confident_ptr + slot)
-        step_after = tl.load(step_ptr + slot)
-        converged = (stable & confident & (new_hist_len >= ST)) | (
-            step_after >= max_steps
-        )
-        tl.store(is_encoder_ptr + slot, converged)
-
 
 class DiffusionGemma4ModelState(ModelState):
     """ModelState for DiffusionGemma4.
@@ -846,11 +845,6 @@ class DiffusionSampler:
 
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
-        self._gumbel_temp = torch.zeros(
-            max_num_reqs, dtype=torch.float32, device=device
-        )
-        self._gumbel_seeds = torch.zeros(max_num_reqs, dtype=torch.long, device=device)
-        self._rng_counter = 0
         self._sampled = torch.zeros(
             max_num_reqs,
             self.canvas_length,
@@ -860,12 +854,6 @@ class DiffusionSampler:
         self._num_sampled = torch.zeros(
             max_num_reqs,
             dtype=torch.int32,
-            device=device,
-        )
-        self._eb_accepted_mask = torch.zeros(
-            max_num_reqs,
-            self.canvas_length,
-            dtype=torch.bool,
             device=device,
         )
         self._decode_slots = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
@@ -945,145 +933,6 @@ class DiffusionSampler:
         decode_idx = self._decode_idx.gpu[:num_decode]
         return per_req_nlogits_np, decode_slots_np, decode_slots, decode_idx, num_decode
 
-    def _compute_temperature(self, decode_slots: torch.Tensor) -> torch.Tensor:
-        """Linear temperature schedule matching HF's LogitsProcessor."""
-        states = self.diffusion_states
-        steps = states.step[decode_slots].float()
-        remaining = (states.max_denoising_steps - steps).clamp(min=1.0)
-        return self.t_min + (self.t_max - self.t_min) * (
-            remaining / states.max_denoising_steps
-        )
-
-    def _sample_tokens(
-        self,
-        logits: torch.Tensor,
-        decode_slots: torch.Tensor,
-        num_decode: int,
-        temp: torch.Tensor,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gumbel-max sample + argmax from temperature-scaled logits."""
-        CL = self.canvas_length
-        flat_logits = logits.reshape(num_decode * CL, -1)
-        expanded_idx = decode_slots.repeat_interleave(CL)
-
-        self._gumbel_temp[decode_slots] = temp
-        self._rng_counter += 1
-        self._gumbel_seeds.index_fill_(0, decode_slots, self._rng_counter)
-        pos = torch.arange(CL, device=device).repeat(num_decode)
-
-        apply_temperature(flat_logits, expanded_idx, self._gumbel_temp)
-        new_tokens = gumbel_sample(
-            flat_logits,
-            expanded_idx,
-            self._gumbel_temp,
-            self._gumbel_seeds,
-            pos,
-            apply_temperature=False,
-        ).reshape(num_decode, CL)
-        argmax_tokens = flat_logits.argmax(dim=-1).reshape(num_decode, CL)
-        return flat_logits, new_tokens, argmax_tokens
-
-    def _compute_probs_and_confidence(
-        self,
-        flat_logits: torch.Tensor,
-        decode_slots: torch.Tensor,
-        num_decode: int,
-    ) -> None:
-        """Compute probs for self-conditioning and confidence from entropy."""
-        states = self.diffusion_states
-        CL = self.canvas_length
-
-        log_probs = flat_logits.reshape(num_decode, CL, -1).float().log_softmax(dim=-1)
-        probs = log_probs.exp()
-        sc_vocab = states.self_conditioning_probs.shape[-1]
-        if probs.shape[-1] < sc_vocab:
-            probs = F.pad(probs, (0, sc_vocab - probs.shape[-1]))
-        states.self_conditioning_probs[decode_slots] = probs.to(
-            states.self_conditioning_probs.dtype
-        )
-
-        token_entropy = -(probs * log_probs).sum(dim=-1)
-        mean_entropy = token_entropy.mean(dim=-1)
-        states.confident[decode_slots] = mean_entropy < self.confidence_threshold
-
-        if self.use_entropy_bound:
-            self._compute_entropy_bound_mask(token_entropy, num_decode)
-
-    def _compute_entropy_bound_mask(
-        self,
-        token_entropy: torch.Tensor,
-        num_decode: int,
-    ) -> None:
-        """Compute acceptance mask for EntropyBound sampler."""
-        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1, descending=False)
-        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
-        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
-        sorted_mask = (cumsum_ent - cummax_ent) <= self.entropy_bound
-        eb_accepted = torch.zeros_like(sorted_mask)
-        eb_accepted.scatter_(dim=-1, index=sorted_idx, src=sorted_mask)
-        self._eb_accepted_mask[:num_decode] = eb_accepted
-
-    def _run_post_sample_kernel(
-        self,
-        new_tokens: torch.Tensor,
-        argmax_tokens: torch.Tensor,
-        sampled: torch.Tensor,
-        num_sampled: torch.Tensor,
-        decode_slots: torch.Tensor,
-        decode_idx: torch.Tensor,
-        num_decode: int,
-    ) -> None:
-        """Run the fused commit/denoise/convergence Triton kernel."""
-        states = self.diffusion_states
-        CL = self.canvas_length
-        _diffusion_post_sample_kernel[(num_decode,)](
-            new_tokens,
-            argmax_tokens,
-            states.canvas,
-            states.argmax_canvas,
-            states.step,
-            states.is_encoder_phase,
-            states.confident,
-            states.accepted_canvas_history,
-            states.accepted_canvas_history_len,
-            states.self_conditioning_probs,
-            sampled,
-            num_sampled,
-            decode_slots,
-            decode_idx,
-            self._eb_accepted_mask,
-            states.canvas.stride(0),
-            states.argmax_canvas.stride(0),
-            states.accepted_canvas_history.stride(0),
-            states.accepted_canvas_history.stride(1),
-            states.self_conditioning_probs.stride(0),
-            states.self_conditioning_probs.stride(1),
-            sampled.stride(0),
-            self._eb_accepted_mask.stride(0),
-            states.max_denoising_steps,
-            self.renoise_ratio_modifier,
-            self.ar_mask_noise_proportion,
-            self.use_autoregressive_mask,
-            self.vocab_size,
-            self._rng_counter,
-            CANVAS_LEN=CL,
-            ST=states.stability_threshold,
-            BLOCK_SIZE=triton.next_power_of_2(CL),
-            VOCAB_BLOCK=min(triton.next_power_of_2(self.vocab_size), 4096),
-            USE_ENTROPY_BOUND=self.use_entropy_bound,
-        )
-
-    def _handle_convergence(self, decode_slots: torch.Tensor) -> None:
-        """Copy argmax_canvas → canvas for converged slots (no CPU sync)."""
-        states = self.diffusion_states
-        converged = states.is_encoder_phase[decode_slots].unsqueeze(1)
-        states.canvas[decode_slots] = torch.where(
-            converged,
-            states.argmax_canvas[decode_slots],
-            states.canvas[decode_slots],
-        )
-
     def _build_output(
         self,
         input_batch: Any,
@@ -1092,12 +941,8 @@ class DiffusionSampler:
         per_req_nlogits_np: np.ndarray,
         device: torch.device,
     ) -> SamplerOutput:
-        """Copy draft tokens and compute num_rejected."""
-        CL = self.canvas_length
+        """Compute num_rejected and build SamplerOutput."""
         num_reqs = input_batch.num_reqs
-        slots_gpu = input_batch.idx_mapping[:num_reqs]
-        states = self.diffusion_states
-        self.req_states.draft_tokens[slots_gpu, :CL] = states.canvas[slots_gpu]
 
         self._query_lens.np[:num_reqs] = np.diff(
             input_batch.query_start_loc_np[: num_reqs + 1]
@@ -1136,40 +981,54 @@ class DiffusionSampler:
         if input_batch.num_draft_tokens == 0:
             return self._handle_prefill(input_batch, device)
 
-        per_req_nlogits_np, decode_slots_np, decode_slots, decode_idx, num_decode = (
+        # --- CPU/NumPy setup (outside compile) ---
+        per_req_nlogits_np, _, decode_slots, decode_idx, num_decode = (
             self._get_decode_requests(input_batch, device)
         )
-
-        temp = self._compute_temperature(decode_slots)
-        flat_logits, new_tokens, argmax_tokens = self._sample_tokens(
-            logits,
-            decode_slots,
-            num_decode,
-            temp,
-            device,
-        )
-        self._compute_probs_and_confidence(flat_logits, decode_slots, num_decode)
 
         sampled = self._sampled[:num_reqs]
         sampled.zero_()
         num_sampled = self._num_sampled[:num_reqs]
         num_sampled.zero_()
 
-        self._run_post_sample_kernel(
-            new_tokens,
-            argmax_tokens,
-            sampled,
-            num_sampled,
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        states = self.diffusion_states
+
+        # --- Single compiled call: temp → sample → probs → post-process ---
+        _compiled_sample_step(
+            logits,
             decode_slots,
             decode_idx,
-            num_decode,
-        )
-        self._handle_convergence(decode_slots)
-
-        return self._build_output(
-            input_batch,
+            all_slots,
+            # State
+            states.canvas,
+            states.argmax_canvas,
+            states.step,
+            states.is_encoder_phase,
+            states.confident,
+            states.self_conditioning_probs,
+            states.accepted_canvas_history,
+            states.accepted_canvas_history_len,
+            # Output
             sampled,
             num_sampled,
-            per_req_nlogits_np,
-            device,
+            self.req_states.draft_tokens,
+            # Config
+            max_denoising_steps=float(states.max_denoising_steps),
+            t_min=self.t_min,
+            t_max=self.t_max,
+            confidence_threshold=self.confidence_threshold,
+            vocab_size=self.vocab_size,
+            CL=self.canvas_length,
+            ST=states.stability_threshold,
+            use_entropy_bound=self.use_entropy_bound,
+            entropy_bound=self.entropy_bound or 0.0,
+            renoise_ratio_modifier=self.renoise_ratio_modifier,
+            ar_mask_noise_proportion=self.ar_mask_noise_proportion,
+            use_autoregressive_mask=self.use_autoregressive_mask,
         )
+
+        return self._build_output(
+            input_batch, sampled, num_sampled, per_req_nlogits_np, device
+        )
+
