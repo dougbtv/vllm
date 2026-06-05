@@ -198,56 +198,66 @@ class SpecDecodingProm:
         speculative_config: SpeculativeConfig | None,
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
+        is_diffusion: bool = False,
     ):
-        self.spec_decoding_enabled = speculative_config is not None
+        # Diffusion (dLLM) models reuse the spec-decode counters but expose them
+        # under diffusion-native names; the per-position acceptance vector does
+        # not apply, so it is omitted.
+        self.is_diffusion = is_diffusion
+        self.spec_decoding_enabled = speculative_config is not None or is_diffusion
         if not self.spec_decoding_enabled:
             return
 
-        counter_drafts = self._counter_cls(
-            name="vllm:spec_decode_num_drafts",
-            documentation="Number of spec decoding drafts.",
-            labelnames=labelnames,
-        )
-        self.counter_spec_decode_num_drafts = create_metric_per_engine(
-            counter_drafts, per_engine_labelvalues
-        )
+        if is_diffusion:
+            counter_specs = [
+                ("vllm:diffusion_num_denoising_steps", "Number of denoising steps."),
+                (
+                    "vllm:diffusion_num_canvas_positions",
+                    "Number of canvas positions evaluated.",
+                ),
+                (
+                    "vllm:diffusion_num_committed_tokens",
+                    "Number of committed (finalized) tokens.",
+                ),
+            ]
+        else:
+            counter_specs = [
+                ("vllm:spec_decode_num_drafts", "Number of spec decoding drafts."),
+                ("vllm:spec_decode_num_draft_tokens", "Number of draft tokens."),
+                ("vllm:spec_decode_num_accepted_tokens", "Number of accepted tokens."),
+            ]
 
-        counter_draft_tokens = self._counter_cls(
-            name="vllm:spec_decode_num_draft_tokens",
-            documentation="Number of draft tokens.",
-            labelnames=labelnames,
-        )
-        self.counter_spec_decode_num_draft_tokens = create_metric_per_engine(
-            counter_draft_tokens, per_engine_labelvalues
-        )
+        counters = [
+            create_metric_per_engine(
+                self._counter_cls(name=name, documentation=doc, labelnames=labelnames),
+                per_engine_labelvalues,
+            )
+            for name, doc in counter_specs
+        ]
+        # num_drafts/num_draft_tokens/num_accepted_tokens map onto denoising
+        # steps/canvas positions/committed tokens in the diffusion path.
+        self.counter_spec_decode_num_drafts = counters[0]
+        self.counter_spec_decode_num_draft_tokens = counters[1]
+        self.counter_spec_decode_num_accepted_tokens = counters[2]
 
-        counter_accepted_tokens = self._counter_cls(
-            name="vllm:spec_decode_num_accepted_tokens",
-            documentation="Number of accepted tokens.",
-            labelnames=labelnames,
-        )
-        self.counter_spec_decode_num_accepted_tokens = create_metric_per_engine(
-            counter_accepted_tokens, per_engine_labelvalues
-        )
-
-        assert speculative_config is not None
-        num_spec_tokens = (
-            speculative_config.num_speculative_tokens
-            if self.spec_decoding_enabled
-            else 0
-        )
-        pos_labelnames = labelnames + ["position"]
-        base_counter = self._counter_cls(
-            name="vllm:spec_decode_num_accepted_tokens_per_pos",
-            documentation="Accepted tokens per draft position.",
-            labelnames=pos_labelnames,
-        )
         self.counter_spec_decode_num_accepted_tokens_per_pos: dict[
             int, list[prometheus_client.Counter]
-        ] = {
-            idx: [base_counter.labels(*lv, str(pos)) for pos in range(num_spec_tokens)]
-            for idx, lv in per_engine_labelvalues.items()
-        }
+        ] = {}
+        if not is_diffusion:
+            assert speculative_config is not None
+            num_spec_tokens = speculative_config.num_speculative_tokens
+            pos_labelnames = labelnames + ["position"]
+            base_counter = self._counter_cls(
+                name="vllm:spec_decode_num_accepted_tokens_per_pos",
+                documentation="Accepted tokens per draft position.",
+                labelnames=pos_labelnames,
+            )
+            self.counter_spec_decode_num_accepted_tokens_per_pos = {
+                idx: [
+                    base_counter.labels(*lv, str(pos)) for pos in range(num_spec_tokens)
+                ]
+                for idx, lv in per_engine_labelvalues.items()
+            }
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
@@ -262,6 +272,6 @@ class SpecDecodingProm:
             spec_decoding_stats.num_accepted_tokens
         )
         for pos, counter in enumerate(
-            self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
+            self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])

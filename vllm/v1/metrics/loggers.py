@@ -438,7 +438,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         per_engine_labelvalues = self.per_engine_labelvalues
 
         self.spec_decoding_prom = self._spec_decoding_cls(
-            vllm_config.speculative_config, labelnames, per_engine_labelvalues
+            vllm_config.speculative_config,
+            labelnames,
+            per_engine_labelvalues,
+            is_diffusion=vllm_config.model_config.is_diffusion,
         )
         self.kv_connector_prom = self._kv_connector_cls(
             vllm_config, labelnames, per_engine_labelvalues
