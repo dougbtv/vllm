@@ -269,10 +269,6 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
             self.config = saved_config
 
 
-DEFAULT_STABILITY_THRESHOLD = 2
-DEFAULT_CONFIDENCE_THRESHOLD = 0.005
-
-
 @torch.compile(dynamic=True)
 def _compute_num_rejected(
     num_logits: torch.Tensor,
@@ -488,7 +484,7 @@ class DiffusionGemma4RequestStates:
         max_denoising_steps: int,
         device: torch.device,
         hidden_size: int,
-        stability_threshold: int = DEFAULT_STABILITY_THRESHOLD,
+        stability_threshold: int,
     ):
         self.max_num_reqs = max_num_reqs
         self.canvas_length = canvas_length
@@ -601,7 +597,9 @@ class DiffusionGemma4ModelState(ModelState):
         )
 
         text_config = self.model_config.hf_text_config
-        hf_config = self.model_config.hf_config
+        # Diffusion sampling params come straight from generation_config.json
+        # (RC0.1 flat layout); the checkpoint is the source of truth.
+        self.gen_config = self.model_config.try_get_generation_config()
         self.diffusion_states = DiffusionGemma4RequestStates(
             max_num_reqs=self.max_num_reqs,
             canvas_length=canvas_length,
@@ -609,11 +607,7 @@ class DiffusionGemma4ModelState(ModelState):
             max_denoising_steps=max_denoising_steps,
             device=device,
             hidden_size=text_config.hidden_size,
-            stability_threshold=getattr(
-                hf_config,
-                "diffusion_stability_threshold",
-                DEFAULT_STABILITY_THRESHOLD,
-            ),
+            stability_threshold=self.gen_config["stability_threshold"],
         )
         self._req_id_to_index: dict[str, int] = {}
 
@@ -646,21 +640,30 @@ class DiffusionGemma4ModelState(ModelState):
         sampler: Any,
         diffusion_config: Any,
     ) -> tuple[Any, Any] | None:
-        hf_config = self.model_config.hf_config
+        gen = self.gen_config
+        # Sampler type is derived from the sampler_config class name (nested
+        # even in the flat layout): EntropyBound* -> entropy_bound, else ar_euler.
+        sampler_cfg = gen.get("sampler_config") or {}
+        if "EntropyBound" in sampler_cfg.get("_cls_name", ""):
+            sampler_type = "entropy_bound"
+            entropy_bound = sampler_cfg.get("entropy_bound")
+            if entropy_bound is None or entropy_bound <= 0:
+                raise ValueError(
+                    f"entropy_bound must be a positive float (got {entropy_bound})"
+                )
+        else:
+            sampler_type = "ar_euler"
+            entropy_bound = None
         return DiffusionSampler(
             sampler=sampler,
             diffusion_config=diffusion_config,
             vocab_size=self.model_config.get_vocab_size(),
             diffusion_states=self.diffusion_states,
-            t_min=getattr(hf_config, "diffusion_t_min", 0.4),
-            t_max=getattr(hf_config, "diffusion_t_max", 0.8),
-            sampler_type=getattr(hf_config, "diffusion_sampler", "ar_euler"),
-            entropy_bound=getattr(hf_config, "diffusion_entropy_bound", None),
-            confidence_threshold=getattr(
-                hf_config,
-                "diffusion_confidence_threshold",
-                DEFAULT_CONFIDENCE_THRESHOLD,
-            ),
+            t_min=gen["t_min"],
+            t_max=gen["t_max"],
+            sampler_type=sampler_type,
+            entropy_bound=entropy_bound,
+            confidence_threshold=gen["confidence_threshold"],
         ), None
 
     def apply_staged_writes(self) -> None:
@@ -819,11 +822,12 @@ class DiffusionSampler:
         renoise_ratio_modifier: float = 0.9,
         ar_mask_noise_proportion: float = 0.0,
         use_autoregressive_mask: bool = True,
-        confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-        t_min: float = 0.4,
-        t_max: float = 0.8,
-        sampler_type: str = "ar_euler",
-        entropy_bound: float | None = None,
+        *,
+        confidence_threshold: float,
+        t_min: float,
+        t_max: float,
+        sampler_type: str,
+        entropy_bound: float | None,
     ):
         self.sampler = sampler
         self.canvas_length = (

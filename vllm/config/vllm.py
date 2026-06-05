@@ -327,7 +327,7 @@ class VllmConfig:
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
     diffusion_config: DiffusionConfig | None = None
-    """Discrete diffusion (dLLM) configuration."""
+    """Diffusion LLM (dLLM) configuration."""
 
     structured_outputs_config: StructuredOutputsConfig = Field(
         default_factory=StructuredOutputsConfig
