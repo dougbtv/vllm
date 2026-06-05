@@ -9,18 +9,23 @@ Single Gemma4 backbone run in two modes (like YOCO):
 Same weights, same layers. The only decoder-unique component is a
 self-conditioning MLP.
 
+Multimodal support: the model always includes a vision tower (shared with
+Gemma4). Images are encoded through the vision tower and projected into
+the LM embedding space via Gemma4MultimodalEmbedder.
+
 Design doc: docs/design/diffusion_gemma4_summary.md
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformers import AutoModel
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -35,11 +40,28 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.gemma4 import (
     Gemma4Model,
 )
-from vllm.model_executor.models.utils import WeightsMapper
+from vllm.model_executor.models.gemma4_mm import (
+    Gemma4DummyInputsBuilder,
+    Gemma4ImageInputs,
+    Gemma4ImagePixelInputs,
+    Gemma4MultimodalEmbedder,
+    Gemma4MultiModalProcessor,
+    Gemma4ProcessingInfo,
+)
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+    SupportsPP,
+)
 
 logger = init_logger(__name__)
 
@@ -73,13 +95,65 @@ class DiffusionGemma4SelfConditioning(nn.Module):
         return self.post_norm(inputs_embeds + sc_signal)
 
 
-class DiffusionGemma4ForConditionalGeneration(nn.Module):
+
+# ---------------------------------------------------------------------------
+# Multimodal processing info (overrides Gemma4 config type check)
+# ---------------------------------------------------------------------------
+
+
+class DiffusionGemma4ProcessingInfo(Gemma4ProcessingInfo):
+    """Processing info for DiffusionGemma4.
+
+    Overrides ``get_hf_config`` to accept ``DiffusionGemmaConfig``
+    (which inherits from ``PretrainedConfig``, not ``Gemma4Config``).
+    Also limits supported modalities to image-only (no audio/video).
+    """
+
+    def get_hf_config(self):
+        # DiffusionGemmaConfig doesn't inherit from Gemma4Config, so we
+        # accept any PretrainedConfig here.
+        return self.ctx.get_hf_config()
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        # DiffusionGemma4 only supports image inputs (no audio/video).
+        return {"image": None}
+
+    def get_mm_max_tokens_per_item(
+        self, seq_len: int, mm_counts: Mapping[str, int]
+    ) -> Mapping[str, int] | None:
+        config = self.get_hf_config()
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is None:
+            return {"image": 0}
+        # vision_config may be a raw dict (DiffusionGemmaConfig doesn't
+        # convert it to a config object) or a proper config object.
+        if isinstance(vision_config, dict):
+            tokens_per_image = vision_config.get("default_output_length", 256)
+        else:
+            tokens_per_image = getattr(
+                vision_config, "default_output_length", 256
+            )
+        return {"image": tokens_per_image}
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Gemma4MultiModalProcessor,
+    info=DiffusionGemma4ProcessingInfo,
+    dummy_inputs=Gemma4DummyInputsBuilder,
+)
+class DiffusionGemma4ForConditionalGeneration(
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+):
     """DiffusionGemma4 for vLLM.
 
     Single Gemma4 backbone that switches between encoder and decoder mode.
     The encoder path uses standard Gemma4 layers (causal attention, KV write).
     The decoder path uses the same weights with bidirectional attention and
     KV read-only, plus self-conditioning.
+
+    Always includes a vision tower (same as Gemma4) for image understanding.
 
     In practice, the model's forward() dispatches based on the `mode` kwarg
     set by DiffusionGemma4ModelState.prepare_inputs().
@@ -109,6 +183,7 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
         config = vllm_config.model_config.hf_config
         text_config = vllm_config.model_config.hf_text_config
         self.config = config
+        self.model_dtype = vllm_config.model_config.dtype
 
         # DiffusionGemma4 feeds raw (non-prenormed) input to the MoE router,
         # matching the HF decoder which does router(residual) not
@@ -122,14 +197,26 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
         # v_proj weights for full-attention layers; without this flag they
         # would silently load with random V projections.
         text_config.attention_k_eq_v = True
-        from vllm.model_executor.models.utils import maybe_prefix
 
-        # Use maybe_prefix to ensure correct weight name prefixes for quantization.
-        # The quantization config uses hf_to_vllm_mapper to match checkpoint weight
-        # names to model parameter names. If prefix="", using f"{prefix}.model" would
-        # create ".model" (invalid), but maybe_prefix returns "model". This ensures
-        # the mapper correctly transforms "model.decoder.layers.0.weight" ->
-        # "model.layers.0.weight" for quantized weight loading.
+        # ---- Vision tower ----
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is not None:
+            self.vision_tower = AutoModel.from_config(
+                config=vision_config
+            )
+            self.embed_vision = Gemma4MultimodalEmbedder(
+                vision_config,
+                text_config,
+                prefix=maybe_prefix(prefix, "embed_vision"),
+            )
+        else:
+            self.vision_tower = None
+            self.embed_vision = None
+
+        # ---- Language backbone (Gemma4Model) ----
+        # Use maybe_prefix to ensure correct weight name prefixes for
+        # quantization. The quantization config uses hf_to_vllm_mapper to
+        # match checkpoint weight names to model parameter names.
         self.model = Gemma4Model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -164,8 +251,11 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
             eps=getattr(text_config, "rms_norm_eps", 1e-6),
         )
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+
 
     def compute_self_conditioning(
         self,
@@ -178,6 +268,192 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
         ) * self.model.normalizer.to(inputs_embeds.dtype)
         return self.self_conditioning(inputs_embeds, soft_embeds)
 
+    # ------------------------------------------------------------------ #
+    # Multimodal: image input parsing
+    # ------------------------------------------------------------------ #
+
+    def _parse_and_validate_image_input(
+        self, **kwargs: object
+    ) -> Gemma4ImageInputs | None:
+        pixel_values = kwargs.pop("pixel_values", None)
+        pixel_position_ids = kwargs.pop("pixel_position_ids", None)
+        image_embeds = kwargs.pop("image_embeds", None)
+        assert image_embeds is None, (
+            "DiffusionGemma4 does not support image_embeds."
+        )
+        if pixel_values is None:
+            return None
+        return Gemma4ImagePixelInputs(
+            pixel_values=pixel_values,
+            pixel_position_ids=pixel_position_ids,
+        )
+
+    def _parse_and_validate_multimodal_inputs(
+        self, **kwargs: object
+    ) -> dict[str, Gemma4ImageInputs | None]:
+        mm_input_by_modality: dict[str, Any] = {}
+        for input_key in list(kwargs):
+            if (
+                input_key in ("pixel_values", "image_embeds")
+                and "image" not in mm_input_by_modality
+            ):
+                mm_input_by_modality["image"] = (
+                    self._parse_and_validate_image_input(**kwargs)
+                )
+        return mm_input_by_modality
+
+    # ------------------------------------------------------------------ #
+    # Multimodal: image processing through vision tower
+    # ------------------------------------------------------------------ #
+
+    def _process_image_input(
+        self,
+        image_input: Gemma4ImageInputs,
+    ) -> list[torch.Tensor]:
+        """Encode images through the vision tower.
+
+        Same logic as Gemma4ForConditionalGeneration._process_image_input.
+        """
+        from vllm.model_executor.models.gemma4_mm import (
+            Gemma4ForConditionalGeneration as Gemma4MM,
+        )
+
+        pixel_values = image_input["pixel_values"]
+        pixel_position_ids = image_input["pixel_position_ids"]
+
+        vt = self.vision_tower
+        vision_cfg = self.config.vision_config
+        pooling_k2 = vision_cfg.pooling_kernel_size**2
+
+        buckets: dict[
+            int, list[tuple[int, torch.Tensor, torch.Tensor]]
+        ] = {}
+        total_images = (
+            len(pixel_values)
+            if isinstance(pixel_values, list)
+            else pixel_values.shape[0]
+        )
+
+        for idx in range(total_images):
+            pv = pixel_values[idx]
+            pp = pixel_position_ids[idx]
+            buckets.setdefault(pv.shape[0], []).append((idx, pv, pp))
+
+        last_hidden_states_map: dict[int, torch.Tensor] = {}
+        for patches, items in buckets.items():
+            free, total = current_platform.mem_get_info()
+            max_batch_size = min(
+                len(items),
+                Gemma4MM._encoder_chunk(
+                    patches,
+                    free,
+                    total,
+                    vision_cfg.position_embedding_size,
+                ),
+            )
+
+            for chunk_idx in range(0, len(items), max_batch_size):
+                chunk_items = items[
+                    chunk_idx : chunk_idx + max_batch_size
+                ]
+
+                pv_tensor = torch.cat(
+                    [item[1].unsqueeze(0) for item in chunk_items],
+                    dim=0,
+                )
+                pp_tensor = torch.cat(
+                    [item[2].unsqueeze(0) for item in chunk_items],
+                    dim=0,
+                )
+                pad_tensor = (pp_tensor == -1).all(dim=-1)
+
+                inputs_embeds = vt.patch_embedder(
+                    pv_tensor,
+                    pp_tensor,
+                    pad_tensor,
+                ).to(self.model_dtype)
+                encoder_outputs = vt.encoder(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=~pad_tensor,
+                    pixel_position_ids=pp_tensor,
+                )
+                hidden_states = encoder_outputs.last_hidden_state
+
+                for i, (orig_idx, _, _) in enumerate(chunk_items):
+                    last_hidden_states_map[orig_idx] = hidden_states[i]
+
+        all_valid_states: list[torch.Tensor] = (
+            [None] * total_images  # type: ignore[list-item]
+        )
+        valid_lens = [0] * total_images
+
+        for orig_idx in range(total_images):
+            chunk_hidden = last_hidden_states_map[orig_idx]
+            output_length = chunk_hidden.shape[0] // pooling_k2
+
+            single_hidden = chunk_hidden.unsqueeze(0)
+            single_pos_ids = pixel_position_ids[orig_idx].unsqueeze(0)
+            padding_positions = (single_pos_ids == -1).all(dim=-1)
+
+            pooled_states, valid_mask = vt.pooler(
+                hidden_states=single_hidden,
+                pixel_position_ids=single_pos_ids,
+                padding_positions=padding_positions,
+                output_length=output_length,
+            )
+            valid_states = pooled_states[valid_mask]
+
+            if getattr(vt.config, "standardize", False):
+                valid_states = (
+                    (valid_states - vt.std_bias) * vt.std_scale
+                )
+
+            all_valid_states[orig_idx] = valid_states
+            valid_lens[orig_idx] = valid_states.shape[0]
+
+        flat_valid_states = torch.cat(all_valid_states, dim=0).to(
+            self.model_dtype
+        )
+        flat_proj_embs = self.embed_vision(
+            inputs_embeds=flat_valid_states.unsqueeze(0)
+        ).squeeze(0)
+
+        per_image_embeddings: list[torch.Tensor] = []
+        offset = 0
+        for length in valid_lens:
+            per_image_embeddings.append(
+                flat_proj_embs[offset : offset + length]
+            )
+            offset += length
+
+        return per_image_embeddings
+
+    # ------------------------------------------------------------------ #
+    # MultiModalEmbeddings interface
+    # ------------------------------------------------------------------ #
+
+    def embed_multimodal(
+        self, **kwargs: object
+    ) -> MultiModalEmbeddings:
+        mm_input_by_modality = (
+            self._parse_and_validate_multimodal_inputs(**kwargs)
+        )
+        multimodal_embeddings: list[torch.Tensor] = []
+
+        for modality, multimodal_input in mm_input_by_modality.items():
+            if multimodal_input is None:
+                continue
+            if modality == "image":
+                multimodal_embeddings.extend(
+                    self._process_image_input(multimodal_input)
+                )
+
+        return multimodal_embeddings
+
+    # ------------------------------------------------------------------ #
+    # Forward
+    # ------------------------------------------------------------------ #
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -186,6 +462,8 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        if intermediate_tensors is not None:
+            inputs_embeds = None
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -207,15 +485,17 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights from checkpoint.
 
-        Checkpoint layout (HF DiffusionGemma4):
-          model.encoder.language_model.layers.*  → backbone
-          model.decoder.layers.*                 → backbone (tied)
-          model.decoder.embed_tokens.*           → embeddings
-          self_conditioning.*                    → self-conditioning MLP
-          lm_head.*                              → LM head (tied)
+        Checkpoint layout (HF DiffusionGemma):
+          model.encoder.vision_tower.*            → vision tower
+          model.encoder.embed_vision.*            → vision embedder
+          model.encoder.language_model.layers.*   → backbone
+          model.decoder.layers.*                  → backbone (tied)
+          model.decoder.embed_tokens.*            → embeddings
+          model.decoder.self_conditioning.*       → self-conditioning MLP
+          lm_head.*                               → LM head (tied)
 
         We load encoder weights into our single ``Gemma4Model`` backbone,
-        skip duplicate decoder backbone weights, and handle
+        skip duplicate decoder backbone weights, handle vision tower and
         self-conditioning separately.
         """
 
@@ -224,6 +504,16 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
             for n, p in self.named_parameters()
             if n.startswith("self_conditioning.")
         )
+
+        # Collect vision tower + embedder parameter AND buffer names.
+        # Buffers are needed for std_bias/std_scale (standardization).
+        vision_params: dict[str, torch.Tensor] = {}
+        for n, p in self.named_parameters():
+            if n.startswith(("vision_tower.", "embed_vision.")):
+                vision_params[n] = p
+        for n, b in self.named_buffers():
+            if n.startswith(("vision_tower.", "embed_vision.")):
+                vision_params[n] = b
 
         def _remap_weights():
             # Use full weight names (including suffixes like .weight_scale, .weight_packed)
@@ -242,6 +532,35 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
                     if sc_name in sc_params:
                         sc_params[sc_name].data.copy_(weight)
                     continue
+
+                # Vision tower: model.encoder.vision_tower.* → vision_tower.*
+                # In HF, the vision tower is a sibling of language_model
+                # under the encoder module.
+                if name.startswith("model.encoder.vision_tower."):
+                    vt_name = name[len("model.encoder."):]
+                    if vt_name in vision_params:
+                        vision_params[vt_name].data.copy_(weight)
+                    else:
+                        logger.warning(
+                            "Vision tower weight %s (mapped to %s) "
+                            "not found in model", name, vt_name)
+                    continue
+
+                # Vision embedder: model.encoder.embed_vision.* → embed_vision.*
+                if name.startswith("model.encoder.embed_vision."):
+                    ev_name = name[len("model.encoder."):]
+                    if ev_name in vision_params:
+                        vision_params[ev_name].data.copy_(weight)
+                    else:
+                        logger.warning(
+                            "Embed vision weight %s (mapped to %s) "
+                            "not found in model", name, ev_name)
+                    continue
+
+                # Skip vestigial embed_vision.embedding weights.
+                if "embed_vision.embedding." in name:
+                    continue
+
                 # Encoder backbone → model.*
                 if name.startswith("model.encoder.language_model."):
                     name = name.replace("model.encoder.language_model.", "model.")
@@ -255,6 +574,8 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
                 seen_weights.add(name)
                 yield name, weight
 
+
+
         # Delegate to Gemma4ForCausalLM.load_weights for the backbone,
         # which handles stacked params, MoE, k_eq_v, etc.
         # Temporarily set self.config to text_config since Gemma4's
@@ -267,6 +588,18 @@ class DiffusionGemma4ForConditionalGeneration(nn.Module):
             Gemma4ForCausalLM.load_weights(self, _remap_weights())
         finally:
             self.config = saved_config
+
+    @classmethod
+    def get_placeholder_str(
+        cls, modality: str, i: int
+    ) -> str | None:
+        if modality == "image":
+            return "<image_soft_token>"
+        raise ValueError(f"Unsupported modality: {modality}")
+
+
+DEFAULT_STABILITY_THRESHOLD = 2
+DEFAULT_CONFIDENCE_THRESHOLD = 0.005
 
 
 @torch.compile(dynamic=True)
@@ -586,9 +919,26 @@ class DiffusionGemma4ModelState(ModelState):
         self.model = model
         self.device = device
 
+        self.supports_mm_inputs = encoder_cache is not None
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = self.model_config.max_model_len
+        self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
+        self.dtype = self.model_config.dtype
+
+        if self.supports_mm_inputs:
+            from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+            from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
+            assert isinstance(encoder_cache, EncoderCache)
+            self.encoder_cache = encoder_cache
+            self.encoder_runner = EncoderRunner(
+                model=self.model,
+                max_num_tokens=self.max_num_tokens,
+                hidden_size=self.inputs_embeds_size,
+                encoder_cache=encoder_cache,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
         diffusion_config = vllm_config.diffusion_config
         canvas_length = diffusion_config.canvas_length if diffusion_config else 32
@@ -682,7 +1032,33 @@ class DiffusionGemma4ModelState(ModelState):
             self.diffusion_states.remove_request(idx)
 
     def get_mm_embeddings(self, scheduled_encoder_inputs, input_batch):
-        return None
+        if not self.supports_mm_inputs:
+            return None
+
+        mm_hashes, mm_kwargs = self.encoder_runner.prepare_mm_inputs(
+            scheduled_encoder_inputs
+        )
+        if mm_kwargs:
+            encoder_outputs = self.encoder_runner.execute_mm_encoder(
+                mm_kwargs
+            )
+            self.encoder_cache.encoder_outputs.update(
+                zip(mm_hashes, encoder_outputs)
+            )
+
+        mm_embeds, is_mm_embed = self.encoder_runner.gather_mm_embeddings(
+            input_batch.req_ids,
+            input_batch.num_tokens,
+            input_batch.num_scheduled_tokens,
+            input_batch.query_start_loc_np,
+            input_batch.prefill_len_np,
+            input_batch.num_computed_prefill_tokens_np,
+        )
+        input_ids_unpadded = input_batch.input_ids[:input_batch.num_tokens]
+        inputs_embeds = self.encoder_runner.get_inputs_embeds(
+            input_ids_unpadded, mm_embeds, is_mm_embed
+        )
+        return inputs_embeds[:input_batch.num_tokens_after_padding]
 
     @torch.compile(dynamic=True)
     def _apply_self_conditioning(
@@ -709,23 +1085,26 @@ class DiffusionGemma4ModelState(ModelState):
         num_tokens = input_batch.num_tokens
         num_reqs = input_batch.num_reqs
 
+        # Prefill stage: the model runner already computes inputs_embeds
+        # (including any multimodal embeddings from embed_multimodal).
+        # Don't override — just let it flow through.
+        if input_batch.num_draft_tokens == 0:
+            return {}
+
         slots_np = input_batch.idx_mapping_np[:num_reqs]
         input_ids = input_batch.input_ids[:num_tokens]
 
         # Write into the PERSISTENT inputs_embeds buffer so FULL CUDA graph
-        # replay sees the latest values at the captured address. Always
-        # compute inputs_embeds (even prefill/warmup) so the compiled
-        # Gemma4Model.forward always sees the inputs_embeds branch.
+        # replay sees the latest values at the captured address.
         num_tokens_padded = input_batch.num_tokens_after_padding
         inputs_embeds = self._inputs_embeds_buf[:num_tokens_padded]
         inputs_embeds[:num_tokens].copy_(self.model.embed_input_ids(input_ids))
 
         # Apply self-conditioning ONLY for denoising decode requests in this
-        # batch. Pure prefill, warmup, profile runs (num_draft_tokens == 0 or
-        # empty state) skip the SC block entirely. Mixed prefill+decode falls
-        # through; the `decode_mask` below filters out prefill (n_per_req=0)
-        # and converged-this-step (`is_encoder_phase=True`) requests.
-        if input_batch.num_draft_tokens > 0 and self._req_id_to_index:
+        # batch. Mixed prefill+decode falls through; the `decode_mask` below
+        # filters out prefill (n_per_req=0) and converged-this-step
+        # (`is_encoder_phase=True`) requests.
+        if self._req_id_to_index:
             num_logits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
             is_decode_indices_np = np.where(num_logits_np > 0)[0]
             num_decode = len(is_decode_indices_np)
