@@ -184,7 +184,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
-        self.num_speculative_steps = 0
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
@@ -1443,8 +1442,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
-        elif self.num_speculative_steps > 0:
+
+        if self.num_speculative_steps > 0:
+            # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+            # not have a speculator (i.e. self.speculator is None) 
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
