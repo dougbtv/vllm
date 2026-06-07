@@ -10,6 +10,7 @@ checkpoints (including the NVFP4/FP8 quantized test checkpoints).
 from typing import Any
 
 from transformers import PretrainedConfig
+from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
 
 
 def _init_text_config(self: PretrainedConfig, **kwargs: Any) -> None:
@@ -32,6 +33,18 @@ def _init_config(
     self.text_config = text_config_class(**(text_config or {}))
     self.canvas_length = canvas_length
     self.self_conditioning_size = self_conditioning_size
+    # Convert vision_config dict to a proper config object so that
+    # downstream code (AutoModel.from_config, ProcessingInfo, etc.)
+    # can access attributes normally.
+    vision_config = kwargs.pop("vision_config", None)
+    if isinstance(vision_config, dict):
+        # Use Gemma4VisionConfig (not bare PretrainedConfig) so that
+        # AutoModel.from_config() can resolve the vision tower model class.
+        # DiffusionGemma's vision tower is architecturally identical to Gemma4's.
+        self.vision_config = Gemma4VisionConfig(**vision_config)
+    else:
+        self.vision_config = vision_config
+    self.audio_config = None  # DiffusionGemma does not support audio
     PretrainedConfig.__init__(self, **kwargs)
 
 
