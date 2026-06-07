@@ -56,10 +56,12 @@ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
+from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
     SupportsPP,
+    SupportsQuant,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 logger = init_logger(__name__)
@@ -138,6 +140,7 @@ class DiffusionGemma4ProcessingInfo(Gemma4ProcessingInfo):
 class DiffusionGemma4ForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
+    SupportsQuant,
     SupportsPP,
 ):
     """DiffusionGemma4 for vLLM.
@@ -195,14 +198,35 @@ class DiffusionGemma4ForConditionalGeneration(
         # ---- Vision tower ----
         vision_config = getattr(config, "vision_config", None)
         if vision_config is not None:
-            self.vision_tower = AutoModel.from_config(
-                config=vision_config
-            )
-            self.embed_vision = Gemma4MultimodalEmbedder(
-                vision_config,
-                text_config,
-                prefix=maybe_prefix(prefix, "embed_vision"),
-            )
+            quant_config = vllm_config.quant_config
+            if quant_config and quant_config.get_name() in [
+                "bitsandbytes",
+                "torchao",
+                "compressed-tensors",
+            ]:
+                tower_quant = quant_config
+            else:
+                quantizable = (
+                    vision_config.hidden_size % 64 == 0
+                    and vision_config.intermediate_size % 64 == 0
+                )
+                tower_quant = quant_config if quantizable else None
+
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.vision_tower = AutoModel.from_config(
+                    config=vision_config
+                )
+                self.embed_vision = Gemma4MultimodalEmbedder(
+                    vision_config,
+                    text_config,
+                    quant_config=tower_quant,
+                    prefix=maybe_prefix(prefix, "embed_vision"),
+                )
+                recursive_replace_linear(
+                    self.vision_tower,
+                    tower_quant,
+                    prefix=maybe_prefix(prefix, "vision_tower"),
+                )
         else:
             # TODO(diffusion): backward-compat for the pre-RC0.1
             # architecture name. Remove once old checkpoints are gone.
