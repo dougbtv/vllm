@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DiffusionGemma4 model, ModelState, and Sampler for vLLM.
+"""DiffusionGemma model, ModelState, and Sampler for vLLM.
 
 Single Gemma4 backbone run in two modes (like YOCO):
 - encoder mode: causal attention, writes KV cache
@@ -13,7 +13,7 @@ Multimodal support: the model always includes a vision tower (shared with
 Gemma4). Images are encoded through the vision tower and projected into
 the LM embedding space via Gemma4MultimodalEmbedder.
 
-Design doc: docs/design/diffusion_gemma4_summary.md
+Design doc: docs/design/diffusion_gemma_summary.md
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 logger = init_logger(__name__)
 
 
-class DiffusionGemma4SelfConditioning(nn.Module):
+class DiffusionGemmaSelfConditioning(nn.Module):
     """Gated MLP that processes soft embeddings from the previous denoising step.
 
     Structurally identical to Gemma4MLP but with self_conditioning_size
@@ -102,8 +102,8 @@ class DiffusionGemma4SelfConditioning(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class DiffusionGemma4ProcessingInfo(Gemma4ProcessingInfo):
-    """Processing info for DiffusionGemma4.
+class DiffusionGemmaProcessingInfo(Gemma4ProcessingInfo):
+    """Processing info for DiffusionGemma.
 
     Overrides ``get_hf_config`` to accept ``DiffusionGemmaConfig``
     (which inherits from ``PretrainedConfig``, not ``Gemma4Config``).
@@ -116,7 +116,7 @@ class DiffusionGemma4ProcessingInfo(Gemma4ProcessingInfo):
         return self.ctx.get_hf_config()
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        # DiffusionGemma4 supports image and video inputs.
+        # DiffusionGemma supports image and video inputs.
         return {"image": None, "video": None}
 
     def get_mm_max_tokens_per_item(
@@ -134,16 +134,16 @@ class DiffusionGemma4ProcessingInfo(Gemma4ProcessingInfo):
 
 @MULTIMODAL_REGISTRY.register_processor(
     Gemma4MultiModalProcessor,
-    info=DiffusionGemma4ProcessingInfo,
+    info=DiffusionGemmaProcessingInfo,
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
-class DiffusionGemma4ForConditionalGeneration(
+class DiffusionGemmaForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
     SupportsQuant,
     SupportsPP,
 ):
-    """DiffusionGemma4 for vLLM.
+    """DiffusionGemma for vLLM.
 
     Single Gemma4 backbone that switches between encoder and decoder mode.
     The encoder path uses standard Gemma4 layers (causal attention, KV write).
@@ -153,7 +153,7 @@ class DiffusionGemma4ForConditionalGeneration(
     Always includes a vision tower (same as Gemma4) for image understanding.
 
     In practice, the model's forward() dispatches based on the `mode` kwarg
-    set by DiffusionGemma4ModelState.prepare_inputs().
+    set by DiffusionGemmaModelState.prepare_inputs().
     """
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -173,7 +173,7 @@ class DiffusionGemma4ForConditionalGeneration(
 
     @staticmethod
     def get_model_state_cls():
-        return DiffusionGemma4ModelState
+        return DiffusionGemmaModelState
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -182,14 +182,14 @@ class DiffusionGemma4ForConditionalGeneration(
         self.config = config
         self.model_dtype = vllm_config.model_config.dtype
 
-        # DiffusionGemma4 feeds raw (non-prenormed) input to the MoE router,
+        # DiffusionGemma feeds raw (non-prenormed) input to the MoE router,
         # matching the HF decoder which does router(residual) not
         # router(pre_norm(residual)).
         text_config.router_uses_prenormed_input = False
 
-        # DiffusionGemma4's full-attention layers have NO v_proj — V is
+        # DiffusionGemma's full-attention layers have NO v_proj — V is
         # computed from k_proj's output (`value_states = key_states` before
-        # k_norm in `DiffusionGemma4DecoderTextAttention.forward`). This is
+        # k_norm in `DiffusionGemmaDecoderTextAttention.forward`). This is
         # the "k_eq_v" variant in our Gemma4 backbone. The checkpoint has no
         # v_proj weights for full-attention layers; without this flag they
         # would silently load with random V projections.
@@ -250,7 +250,7 @@ class DiffusionGemma4ForConditionalGeneration(
         if text_config.tie_word_embeddings:
             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
-        # HF DiffusionGemma4 applies the final-logit softcap in fp32, before
+        # HF DiffusionGemma applies the final-logit softcap in fp32, before
         # any other processing. Do it manually in `compute_logits` so the
         # LogitsProcessor only handles the lm_head GEMM.
         self.final_logit_softcapping = getattr(
@@ -265,7 +265,7 @@ class DiffusionGemma4ForConditionalGeneration(
             getattr(config, "self_conditioning_size", None)
             or text_config.intermediate_size
         )
-        self.self_conditioning = DiffusionGemma4SelfConditioning(
+        self.self_conditioning = DiffusionGemmaSelfConditioning(
             hidden_size=text_config.hidden_size,
             self_conditioning_size=sc_size,
             eps=getattr(text_config, "rms_norm_eps", 1e-6),
@@ -350,7 +350,7 @@ class DiffusionGemma4ForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is not None and self.final_logit_softcapping is not None:
-            # HF DiffusionGemma4 casts to fp32 before softcap for numerical
+            # HF DiffusionGemma casts to fp32 before softcap for numerical
             # stability of the tanh.
             logits = logits.float()
             cap = self.final_logit_softcapping
@@ -676,8 +676,8 @@ def _compiled_sample_step(
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
 
-class DiffusionGemma4RequestStates:
-    """Pre-allocated GPU tensors for DiffusionGemma4 per-request state.
+class DiffusionGemmaRequestStates:
+    """Pre-allocated GPU tensors for DiffusionGemma per-request state.
 
     Follows the indexed-slot pattern used by ``RequestState``.
     """
@@ -771,8 +771,8 @@ class DiffusionGemma4RequestStates:
         self.accepted_canvas_history_len[slot_idx] = 0
         self.self_conditioning_probs[slot_idx] = 0
 
-class DiffusionGemma4ModelState(ModelState):
-    """ModelState for DiffusionGemma4.
+class DiffusionGemmaModelState(ModelState):
+    """ModelState for DiffusionGemma.
 
     Single Gemma4 backbone in two modes:
     - encoder mode (num_draft_tokens == 0): causal attention, writes KV
@@ -832,7 +832,7 @@ class DiffusionGemma4ModelState(ModelState):
         # Diffusion sampling params come straight from generation_config.json
         # (RC0.1 flat layout); the checkpoint is the source of truth.
         self.gen_config = self.model_config.try_get_generation_config()
-        self.diffusion_states = DiffusionGemma4RequestStates(
+        self.diffusion_states = DiffusionGemmaRequestStates(
             max_num_reqs=self.max_num_reqs,
             canvas_length=canvas_length,
             vocab_size=self.model_config.get_vocab_size(),
@@ -1078,7 +1078,7 @@ class DiffusionGemma4ModelState(ModelState):
 
 
 class DiffusionSampler:
-    """Batched accept/renoise sampler for DiffusionGemma4.
+    """Batched accept/renoise sampler for DiffusionGemma.
 
     Follows the same structure as ``vllm.v1.worker.gpu.sample.sampler.Sampler``:
     decomposed into named methods, all GPU state in pre-allocated buffers,
@@ -1090,7 +1090,7 @@ class DiffusionSampler:
         sampler: Any,
         diffusion_config: Any,
         vocab_size: int,
-        diffusion_states: DiffusionGemma4RequestStates | None = None,
+        diffusion_states: DiffusionGemmaRequestStates | None = None,
         renoise_ratio_modifier: float = 0.9,
         ar_mask_noise_proportion: float = 0.0,
         use_autoregressive_mask: bool = True,

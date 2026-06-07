@@ -795,7 +795,9 @@ def get_model_params(config):
         topk = text_config.num_experts_per_tok
         intermediate_size = text_config.moe_intermediate_size
         hidden_size = text_config.hidden_size
-    elif architecture == "DiffusionGemma4ModelForBlockDiffusion":
+    # TODO(diffusion): remove "DiffusionGemma4ModelForBlockDiffusion" once
+    # all checkpoints are finalized to the RC0.1 "DiffusionGemma" naming.
+    elif architecture in ("DiffusionGemmaForBlockDiffusion", "DiffusionGemma4ModelForBlockDiffusion"):
         text_config = config.get_text_config()
         E = text_config.num_experts
         topk = text_config.top_k_experts

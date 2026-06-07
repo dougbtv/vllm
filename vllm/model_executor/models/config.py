@@ -106,10 +106,10 @@ class Gemma4Config(VerifyAndUpdateConfig):
             )
 
 
-class DiffusionGemma4ModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
+class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """Force vllm_c kernels and set diffusion config for DiffusionGemma4.
+        """Force vllm_c kernels and set diffusion config for DiffusionGemma.
 
         Inductor's native-op fusions accumulate small fp differences vs
         the vllm_c C++ kernels across many denoise steps. Enable custom
@@ -118,7 +118,7 @@ class DiffusionGemma4ModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
         Also auto-creates DiffusionConfig from the HF config when the
         user didn't pass ``--diffusion-config``. Diffusion sampling params
         are read straight from generation_config.json at sampler-build time
-        (see DiffusionGemma4's custom_sampler), not injected here.
+        (see DiffusionGemma's custom_sampler), not injected here.
         """
         # Auto-create DiffusionConfig from HF config if not provided.
         if vllm_config.diffusion_config is None:
@@ -629,9 +629,9 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColQwen3_5": Qwen3_5ForConditionalGenerationConfig,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
-    "DiffusionGemmaForBlockDiffusion": DiffusionGemma4ModelForBlockDiffusionConfig,  # noqa: E501
+    "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     # TODO(diffusion): remove once checkpoints finalize to RC0.1 naming.
-    "DiffusionGemma4ModelForBlockDiffusion": DiffusionGemma4ModelForBlockDiffusionConfig,  # noqa: E501
+    "DiffusionGemma4ModelForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,

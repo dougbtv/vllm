@@ -4,7 +4,7 @@
 
 Validates that both triton and flash-attention backends correctly handle
 batches where some sequences use causal masking and others use non-causal
-(bidirectional) masking — needed by DiffusionGemma4.
+(bidirectional) masking — needed by DiffusionGemma.
 """
 
 import pytest

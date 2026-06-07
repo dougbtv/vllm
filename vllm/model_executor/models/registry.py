@@ -118,8 +118,8 @@ _TEXT_GENERATION_MODELS = {
     # TODO(diffusion): backward-compat for the pre-RC0.1 architecture name.
     # These older models are text-only (no vision tower).
     "DiffusionGemma4ModelForBlockDiffusion": (
-        "diffusion_gemma4",
-        "DiffusionGemma4ForConditionalGeneration",
+        "diffusion_gemma",
+        "DiffusionGemmaForConditionalGeneration",
     ),
     "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
@@ -412,8 +412,8 @@ _MULTIMODAL_MODELS = {
         "Gemma3nForConditionalGeneration",
     ),
     "DiffusionGemmaForBlockDiffusion": (
-        "diffusion_gemma4",
-        "DiffusionGemma4ForConditionalGeneration",
+        "diffusion_gemma",
+        "DiffusionGemmaForConditionalGeneration",
     ),
     "Gemma4ForConditionalGeneration": ("gemma4_mm", "Gemma4ForConditionalGeneration"),
     "Gemma4UnifiedForConditionalGeneration": (
