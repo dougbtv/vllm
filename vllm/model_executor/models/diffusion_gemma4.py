@@ -61,7 +61,7 @@ from .interfaces import (
     SupportsMultiModal,
     SupportsPP,
 )
-
+from vllm.model_executor.models.module_mapping import MultiModelKeys
 logger = init_logger(__name__)
 
 
@@ -105,7 +105,7 @@ class DiffusionGemma4ProcessingInfo(Gemma4ProcessingInfo):
 
     Overrides ``get_hf_config`` to accept ``DiffusionGemmaConfig``
     (which inherits from ``PretrainedConfig``, not ``Gemma4Config``).
-    Also limits supported modalities to image-only (no audio/video).
+    Supports image and video modalities.
     """
 
     def get_hf_config(self):
@@ -114,8 +114,8 @@ class DiffusionGemma4ProcessingInfo(Gemma4ProcessingInfo):
         return self.ctx.get_hf_config()
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        # DiffusionGemma4 only supports image inputs (no audio/video).
-        return {"image": None}
+        # DiffusionGemma4 supports image and video inputs.
+        return {"image": None, "video": None}
 
     def get_mm_max_tokens_per_item(
         self, seq_len: int, mm_counts: Mapping[str, int]
@@ -125,16 +125,9 @@ class DiffusionGemma4ProcessingInfo(Gemma4ProcessingInfo):
         if vision_config is None:
             # TODO(diffusion): backward-compat for the pre-RC0.1
             # architecture name. Remove once old checkpoints are gone.
-            return {"image": 0}
-        # vision_config may be a raw dict (DiffusionGemmaConfig doesn't
-        # convert it to a config object) or a proper config object.
-        if isinstance(vision_config, dict):
-            tokens_per_image = vision_config.get("default_output_length", 256)
-        else:
-            tokens_per_image = getattr(
-                vision_config, "default_output_length", 256
-            )
-        return {"image": tokens_per_image}
+            return {"image": 0, "video": 0}
+
+        return super().get_mm_max_tokens_per_item(seq_len, mm_counts)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -281,6 +274,9 @@ class DiffusionGemma4ForConditionalGeneration(
     _parse_and_validate_image_input = (
         Gemma4ForConditionalGeneration._parse_and_validate_image_input
     )
+    _parse_and_validate_video_input = (
+        Gemma4ForConditionalGeneration._parse_and_validate_video_input
+    )
     _parse_and_validate_multimodal_inputs = (
         Gemma4ForConditionalGeneration._parse_and_validate_multimodal_inputs
     )
@@ -290,9 +286,20 @@ class DiffusionGemma4ForConditionalGeneration(
     _process_image_input = (
         Gemma4ForConditionalGeneration._process_image_input
     )
+    _process_video_input = (
+        Gemma4ForConditionalGeneration._process_video_input
+    )
     embed_multimodal = (
         Gemma4ForConditionalGeneration.embed_multimodal
     )
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        """Get the module prefix mapping for multimodal models."""
+        return MultiModelKeys.from_string_field(
+            language_model="model",
+            connector=["embed_vision"],
+            tower_model=["vision_tower"],
+        )
 
     # ------------------------------------------------------------------ #
     # Forward
@@ -435,6 +442,8 @@ class DiffusionGemma4ForConditionalGeneration(
     ) -> str | None:
         if modality == "image":
             return "<image_soft_token>"
+        if modality == "video":
+            return "<|video|>"
         raise ValueError(f"Unsupported modality: {modality}")
 
 

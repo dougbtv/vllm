@@ -44,6 +44,7 @@ def _init_config(
         self.vision_config = Gemma4VisionConfig(**vision_config)
     else:
         self.vision_config = vision_config
+    self.audio_config = None  # DiffusionGemma does not support audio
     PretrainedConfig.__init__(self, **kwargs)
 
 
