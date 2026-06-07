@@ -780,6 +780,15 @@ class DiffusionGemma4ModelState(ModelState):
                 device=self.device,
             )
 
+        # Per-step MM data produced by get_mm_embeddings and consumed by
+        # prepare_inputs.  Stored as raw (mm_embeds, is_mm_embed) so that
+        # prepare_inputs can call embed_input_ids directly into the
+        # persistent _inputs_embeds_buf, avoiding the intermediate copy
+        # through encoder_runner.inputs_embeds.
+        self._pending_mm_embeds: tuple[
+            list[torch.Tensor], torch.Tensor
+        ] | None = None
+
         diffusion_config = vllm_config.diffusion_config
         canvas_length = diffusion_config.canvas_length if diffusion_config else 32
         max_denoising_steps = (
@@ -894,11 +903,18 @@ class DiffusionGemma4ModelState(ModelState):
             input_batch.prefill_len_np,
             input_batch.num_computed_prefill_tokens_np,
         )
-        input_ids_unpadded = input_batch.input_ids[:input_batch.num_tokens]
-        inputs_embeds = self.encoder_runner.get_inputs_embeds(
-            input_ids_unpadded, mm_embeds, is_mm_embed
-        )
-        return inputs_embeds[:input_batch.num_tokens_after_padding]
+
+        if not mm_embeds:
+            # No MM tokens in this batch (e.g. all-decode step).
+            # prepare_inputs will use embed_input_ids (text-only) directly.
+            self._pending_mm_embeds = None
+            return None
+
+        # Stash raw MM ingredients for prepare_inputs to merge directly
+        # into the persistent buffer, avoiding the intermediate copy
+        # through encoder_runner.inputs_embeds.
+        self._pending_mm_embeds = (mm_embeds, is_mm_embed)
+        return None
 
     @torch.compile(dynamic=True)
     def _apply_self_conditioning(
@@ -925,26 +941,30 @@ class DiffusionGemma4ModelState(ModelState):
         num_tokens = input_batch.num_tokens
         num_reqs = input_batch.num_reqs
 
-        # Prefill stage: the model runner already computes inputs_embeds
-        # (including any multimodal embeddings from embed_multimodal).
-        # Don't override — just let it flow through.
-        if input_batch.num_draft_tokens == 0:
-            return {}
-
-        slots_np = input_batch.idx_mapping_np[:num_reqs]
-        input_ids = input_batch.input_ids[:num_tokens]
-
         # Write into the PERSISTENT inputs_embeds buffer so FULL CUDA graph
         # replay sees the latest values at the captured address.
         num_tokens_padded = input_batch.num_tokens_after_padding
         inputs_embeds = self._inputs_embeds_buf[:num_tokens_padded]
-        inputs_embeds[:num_tokens].copy_(self.model.embed_input_ids(input_ids))
 
-        # Apply self-conditioning ONLY for denoising decode requests in this
-        # batch. Mixed prefill+decode falls through; the `decode_mask` below
-        # filters out prefill (n_per_req=0) and converged-this-step
-        # (`is_encoder_phase=True`) requests.
-        if self._req_id_to_index:
+        # Populate embeddings: merge MM features when available,
+        # otherwise embed input_ids as text-only.
+        input_ids = input_batch.input_ids[:num_tokens]
+        if self._pending_mm_embeds is not None:
+            mm_embeds, is_mm_embed = self._pending_mm_embeds
+            self._pending_mm_embeds = None
+            inputs_embeds[:num_tokens].copy_(
+                self.model.embed_input_ids(
+                    input_ids,
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
+            )
+        else:
+            inputs_embeds[:num_tokens].copy_(self.model.embed_input_ids(input_ids))
+
+        # Apply self-conditioning ONLY for denoising decode requests.
+        if input_batch.num_draft_tokens > 0 and self._req_id_to_index:
+            slots_np = input_batch.idx_mapping_np[:num_reqs]
             num_logits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
             is_decode_indices_np = np.where(num_logits_np > 0)[0]
             num_decode = len(is_decode_indices_np)
