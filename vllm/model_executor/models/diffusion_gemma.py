@@ -160,6 +160,8 @@ class DiffusionGemmaForConditionalGeneration(
         orig_to_new_prefix={
             "model.decoder.": "model.",
             "model.encoder.language_model.": "model.",
+            "model.encoder.vision_tower.": "vision_tower.",
+            "model.encoder.embed_vision.": "embed_vision.",
         },
         orig_to_new_substr={
             ".experts.": ".moe.experts.",
