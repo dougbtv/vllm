@@ -369,11 +369,17 @@ class DiffusionGemmaForConditionalGeneration(
             if n.startswith("self_conditioning.")
         )
 
-        # Collect vision tower + embedder parameters for manual loading.
+        # Collect vision tower + embedder parameters AND buffers for manual
+        # loading.  The HF vision tower registers std_bias / std_scale as
+        # buffers (not parameters) when config.standardize is True, so we
+        # must include named_buffers() to avoid "not found in model" warnings.
         vision_params: dict[str, torch.Tensor] = {}
         for n, p in self.named_parameters():
             if n.startswith(("vision_tower.", "embed_vision.")):
                 vision_params[n] = p
+        for n, b in self.named_buffers():
+            if n.startswith(("vision_tower.", "embed_vision.")):
+                vision_params[n] = b
 
         def _remap_weights():
             # Use full weight names (including suffixes like .weight_scale,
