@@ -520,12 +520,8 @@ def _compiled_sample_step(
     vocab_size: int,
     CL: int,
     ST: int,
-    # Sampler mode
-    use_entropy_bound: bool,
+    # Sampler config
     entropy_bound: float,
-    renoise_ratio_modifier: float,
-    ar_mask_noise_proportion: float,
-    use_autoregressive_mask: bool,
 ) -> torch.Tensor:
     """Compiled decode step: temperature → Gumbel sample → probs/confidence →
     accept/renoise → convergence, all as vectorized PyTorch ops.
@@ -562,14 +558,13 @@ def _compiled_sample_step(
     mean_entropy = token_entropy.mean(dim=-1)           # [num_decode]
     confident_tensor[decode_slots] = mean_entropy < confidence_threshold
 
-    # ---- Phase 4: Entropy-bound acceptance mask (if enabled) ----
-    if use_entropy_bound:
-        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
-        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
-        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
-        sorted_mask = (cumsum_ent - cummax_ent) <= entropy_bound
-        eb_mask = torch.zeros_like(sorted_mask)
-        eb_mask.scatter_(1, sorted_idx, sorted_mask)
+    # ---- Phase 4: Entropy-bound acceptance mask ----
+    sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
+    cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+    cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+    sorted_mask = (cumsum_ent - cummax_ent) <= entropy_bound
+    eb_mask = torch.zeros_like(sorted_mask)
+    eb_mask.scatter_(1, sorted_idx, sorted_mask)
 
     # ---- Phase 5: Post-sample ----
     is_commit = is_encoder_phase[decode_slots]          # [num_decode]
@@ -590,35 +585,7 @@ def _compiled_sample_step(
     )
 
     # Compute denoise canvas (accept/renoise)
-    if use_entropy_bound:
-        denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
-    else:
-        remaining_d = (max_denoising_steps - cur_step).clamp(min=1.0)
-        accept_prob = (1.0 / remaining_d).unsqueeze(1)     # [num_decode, 1]
-        renoise_prob = (
-            renoise_ratio_modifier
-            * (remaining_d - 1.0).clamp(min=0.0)
-            / max_denoising_steps
-        ).unsqueeze(1)
-
-        cur_canvas = canvas[decode_slots]
-        accept_mask = torch.rand(num_decode, CL, device=device) < accept_prob
-
-        if use_autoregressive_mask:
-            ar_thresh = ((cur_step + 1.0) / max_denoising_steps).unsqueeze(1)
-            pos_ratio = (
-                torch.arange(CL, device=device).float()
-                * (1.0 - ar_mask_noise_proportion)
-                / max(CL - 1, 1)
-            )
-            accept_mask = accept_mask | (pos_ratio.unsqueeze(0) <= ar_thresh)
-
-        accepted = torch.where(accept_mask, new_tokens, cur_canvas)
-        denoise_canvas = torch.where(
-            torch.rand(num_decode, CL, device=device) < renoise_prob,
-            random_tokens,
-            accepted,
-        )
+    denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
 
     # Canvas: commit → random reinit, denoise → accept/renoise result
     canvas[decode_slots] = torch.where(
@@ -881,19 +848,16 @@ class DiffusionGemmaModelState(ModelState):
         diffusion_config: Any,
     ) -> tuple[Any, Any] | None:
         gen = self.gen_config
-        # Sampler type is derived from the sampler_config class name (nested
-        # even in the flat layout): EntropyBound* -> entropy_bound, else ar_euler.
         sampler_cfg = gen.get("sampler_config") or {}
-        if "EntropyBound" in sampler_cfg.get("_cls_name", ""):
-            sampler_type = "entropy_bound"
-            entropy_bound = sampler_cfg.get("entropy_bound")
-            if entropy_bound is None or entropy_bound <= 0:
-                raise ValueError(
-                    f"entropy_bound must be a positive float (got {entropy_bound})"
-                )
-        else:
-            sampler_type = "ar_euler"
-            entropy_bound = None
+        if "EntropyBound" not in sampler_cfg.get("_cls_name", ""):
+            raise ValueError(
+                "DiffusionGemma requires an EntropyBound sampler_config"
+            )
+        entropy_bound = sampler_cfg.get("entropy_bound")
+        if entropy_bound is None or entropy_bound <= 0:
+            raise ValueError(
+                f"entropy_bound must be a positive float (got {entropy_bound})"
+            )
         return DiffusionSampler(
             sampler=sampler,
             diffusion_config=diffusion_config,
@@ -901,7 +865,6 @@ class DiffusionGemmaModelState(ModelState):
             diffusion_states=self.diffusion_states,
             t_min=gen["t_min"],
             t_max=gen["t_max"],
-            sampler_type=sampler_type,
             entropy_bound=entropy_bound,
             confidence_threshold=gen["confidence_threshold"],
         ), None
@@ -1099,15 +1062,11 @@ class DiffusionSampler:
         diffusion_config: Any,
         vocab_size: int,
         diffusion_states: DiffusionGemmaRequestStates | None = None,
-        renoise_ratio_modifier: float = 0.9,
-        ar_mask_noise_proportion: float = 0.0,
-        use_autoregressive_mask: bool = True,
         *,
         confidence_threshold: float,
         t_min: float,
         t_max: float,
-        sampler_type: str,
-        entropy_bound: float | None,
+        entropy_bound: float,
     ):
         self.sampler = sampler
         self.canvas_length = (
@@ -1119,10 +1078,6 @@ class DiffusionSampler:
         self.req_states = sampler.penalties_state.req_states
         self.vocab_size = vocab_size
         self.diffusion_states = diffusion_states
-        self.renoise_ratio_modifier = renoise_ratio_modifier
-        self.ar_mask_noise_proportion = ar_mask_noise_proportion
-        self.use_autoregressive_mask = use_autoregressive_mask
-        self.use_entropy_bound = sampler_type == "entropy_bound"
         self.entropy_bound = entropy_bound
         self.sampling_states = sampler.sampling_states
         self.penalties_state = sampler.penalties_state
@@ -1315,11 +1270,7 @@ class DiffusionSampler:
             vocab_size=self.vocab_size,
             CL=self.canvas_length,
             ST=states.stability_threshold,
-            use_entropy_bound=self.use_entropy_bound,
-            entropy_bound=self.entropy_bound or 0.0,
-            renoise_ratio_modifier=self.renoise_ratio_modifier,
-            ar_mask_noise_proportion=self.ar_mask_noise_proportion,
-            use_autoregressive_mask=self.use_autoregressive_mask,
+            entropy_bound=self.entropy_bound,
         )
 
         # --- Logprobs: stash on convergence, return on commit ---
