@@ -47,25 +47,23 @@ from vllm.model_executor.models.gemma4_mm import (
     Gemma4MultiModalProcessor,
     Gemma4ProcessingInfo,
 )
+from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from .interfaces import (
-    MultiModalEmbeddings,
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
 )
-from vllm.model_executor.models.module_mapping import MultiModelKeys
+
 logger = init_logger(__name__)
 
 
@@ -96,7 +94,6 @@ class DiffusionGemmaSelfConditioning(nn.Module):
             F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x)
         )
         return self.post_norm(inputs_embeds + sc_signal)
-
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +214,7 @@ class DiffusionGemmaForConditionalGeneration(
                 tower_quant = quant_config if quantizable else None
 
             with self._mark_tower_model(vllm_config, {"image", "video"}):
-                self.vision_tower = AutoModel.from_config(
-                    config=vision_config
-                )
+                self.vision_tower = AutoModel.from_config(config=vision_config)
                 self.embed_vision = Gemma4MultimodalEmbedder(
                     vision_config,
                     text_config,
@@ -279,8 +274,6 @@ class DiffusionGemmaForConditionalGeneration(
             self.model.make_empty_intermediate_tensors
         )
 
-
-
     def compute_self_conditioning(
         self,
         inputs_embeds: torch.Tensor,
@@ -308,18 +301,10 @@ class DiffusionGemmaForConditionalGeneration(
     _parse_and_validate_multimodal_inputs = (
         Gemma4ForConditionalGeneration._parse_and_validate_multimodal_inputs
     )
-    _encoder_chunk = staticmethod(
-        Gemma4ForConditionalGeneration._encoder_chunk
-    )
-    _process_image_input = (
-        Gemma4ForConditionalGeneration._process_image_input
-    )
-    _process_video_input = (
-        Gemma4ForConditionalGeneration._process_video_input
-    )
-    embed_multimodal = (
-        Gemma4ForConditionalGeneration.embed_multimodal
-    )
+    _encoder_chunk = staticmethod(Gemma4ForConditionalGeneration._encoder_chunk)
+    _process_image_input = Gemma4ForConditionalGeneration._process_image_input
+    _process_video_input = Gemma4ForConditionalGeneration._process_video_input
+    embed_multimodal = Gemma4ForConditionalGeneration.embed_multimodal
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix mapping for multimodal models."""
@@ -391,12 +376,10 @@ class DiffusionGemmaForConditionalGeneration(
                 vision_params[n] = p
 
         def _remap_weights():
-            # Use full weight names (including suffixes like .weight_scale, .weight_packed)
-            # for deduplication instead of just the base layer name. This is critical for
-            # quantized checkpoints where each weight has multiple associated tensors
-            # (weight, weight_scale, weight_global_scale, input_global_scale). If we only
-            # track base layer names, all the scales would be incorrectly skipped as
-            # duplicates, causing the model to produce garbage output.
+            # Use full weight names (including suffixes like .weight_scale,
+            # .weight_packed) for dedup instead of just the base layer name. Critical
+            # for quantized checkpoints where each weight has multiple tensors;
+            # tracking only base names skips scales as duplicates.
             seen_weights: set[str] = set()
             for name, weight in weights:
                 # Self-conditioning lives under model.decoder.self_conditioning.*
@@ -412,24 +395,28 @@ class DiffusionGemmaForConditionalGeneration(
                 # In HF, the vision tower is a sibling of language_model
                 # under the encoder module.
                 if name.startswith("model.encoder.vision_tower."):
-                    vt_name = name[len("model.encoder."):]
+                    vt_name = name[len("model.encoder.") :]
                     if vt_name in vision_params:
                         vision_params[vt_name].data.copy_(weight)
                     else:
                         logger.warning(
-                            "Vision tower weight %s (mapped to %s) "
-                            "not found in model", name, vt_name)
+                            "Vision tower weight %s (mapped to %s) not found in model",
+                            name,
+                            vt_name,
+                        )
                     continue
 
                 # Vision embedder: model.encoder.embed_vision.* → embed_vision.*
                 if name.startswith("model.encoder.embed_vision."):
-                    ev_name = name[len("model.encoder."):]
+                    ev_name = name[len("model.encoder.") :]
                     if ev_name in vision_params:
                         vision_params[ev_name].data.copy_(weight)
                     else:
                         logger.warning(
-                            "Embed vision weight %s (mapped to %s) "
-                            "not found in model", name, ev_name)
+                            "Embed vision weight %s (mapped to %s) not found in model",
+                            name,
+                            ev_name,
+                        )
                     continue
 
                 # Skip vestigial embed_vision.embedding weights.
@@ -449,8 +436,6 @@ class DiffusionGemmaForConditionalGeneration(
                 seen_weights.add(name)
                 yield name, weight
 
-
-
         # Delegate to Gemma4ForCausalLM.load_weights for the backbone,
         # which handles stacked params, MoE, k_eq_v, etc.
         # Temporarily set self.config to text_config since Gemma4's
@@ -465,9 +450,7 @@ class DiffusionGemmaForConditionalGeneration(
             self.config = saved_config
 
     @classmethod
-    def get_placeholder_str(
-        cls, modality: str, i: int
-    ) -> str | None:
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality == "image":
             return "<image_soft_token>"
         if modality == "video":
@@ -496,22 +479,22 @@ def _compiled_sample_step(
     # Logits from the model [num_decode * CL, vocab]
     logits: torch.Tensor,
     # Request mapping
-    decode_slots: torch.Tensor,     # [num_decode] int64 → slot indices
-    decode_idx: torch.Tensor,       # [num_decode] int64 → position in num_reqs
-    all_slots: torch.Tensor,        # [num_reqs] int64 → all slot indices
+    decode_slots: torch.Tensor,  # [num_decode] int64 → slot indices
+    decode_idx: torch.Tensor,  # [num_decode] int64 → position in num_reqs
+    all_slots: torch.Tensor,  # [num_reqs] int64 → all slot indices
     # State tensors (modified in-place)
-    canvas: torch.Tensor,           # [max_num_reqs, CL]
-    argmax_canvas: torch.Tensor,    # [max_num_reqs, CL]
-    step_tensor: torch.Tensor,      # [max_num_reqs]
-    is_encoder_phase: torch.Tensor, # [max_num_reqs]
-    confident_tensor: torch.Tensor, # [max_num_reqs]
-    sc_probs: torch.Tensor,         # [max_num_reqs, CL, vocab]
-    history: torch.Tensor,          # [max_num_reqs, ST, CL]
+    canvas: torch.Tensor,  # [max_num_reqs, CL]
+    argmax_canvas: torch.Tensor,  # [max_num_reqs, CL]
+    step_tensor: torch.Tensor,  # [max_num_reqs]
+    is_encoder_phase: torch.Tensor,  # [max_num_reqs]
+    confident_tensor: torch.Tensor,  # [max_num_reqs]
+    sc_probs: torch.Tensor,  # [max_num_reqs, CL, vocab]
+    history: torch.Tensor,  # [max_num_reqs, ST, CL]
     history_len_tensor: torch.Tensor,  # [max_num_reqs]
     # Output tensors (modified in-place)
-    sampled: torch.Tensor,          # [num_reqs, CL]
-    num_sampled: torch.Tensor,      # [num_reqs]
-    draft_tokens: torch.Tensor,     # [max_num_reqs, >=CL]
+    sampled: torch.Tensor,  # [num_reqs, CL]
+    num_sampled: torch.Tensor,  # [num_reqs]
+    draft_tokens: torch.Tensor,  # [max_num_reqs, >=CL]
     # Scalar config
     max_denoising_steps: float,
     t_min: float,
@@ -546,16 +529,16 @@ def _compiled_sample_step(
     # Zero noise when temp==0 (greedy)
     noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
     new_tokens = noisy.view(-1, noisy.shape[-1]).argmax(dim=-1).view(num_decode, CL)
-    argmax_tokens = scaled.view(-1, scaled.shape[-1]).argmax(dim=-1).view(
-        num_decode, CL
+    argmax_tokens = (
+        scaled.view(-1, scaled.shape[-1]).argmax(dim=-1).view(num_decode, CL)
     )
 
     # ---- Phase 3: Probs, self-conditioning, confidence ----
     log_probs = scaled.log_softmax(dim=-1)
     probs = log_probs.exp()
 
-    token_entropy = -(probs * log_probs).sum(dim=-1)   # [num_decode, CL]
-    mean_entropy = token_entropy.mean(dim=-1)           # [num_decode]
+    token_entropy = -(probs * log_probs).sum(dim=-1)  # [num_decode, CL]
+    mean_entropy = token_entropy.mean(dim=-1)  # [num_decode]
     confident_tensor[decode_slots] = mean_entropy < confidence_threshold
 
     # ---- Phase 4: Entropy-bound acceptance mask ----
@@ -567,7 +550,7 @@ def _compiled_sample_step(
     eb_mask.scatter_(1, sorted_idx, sorted_mask)
 
     # ---- Phase 5: Post-sample ----
-    is_commit = is_encoder_phase[decode_slots]          # [num_decode]
+    is_commit = is_encoder_phase[decode_slots]  # [num_decode]
     is_denoise = ~is_commit
     cur_step = step_tensor[decode_slots].float()
 
@@ -607,21 +590,18 @@ def _compiled_sample_step(
     )
 
     # History length: increment for denoise, reset for commit
-    new_hist_len = torch.where(
-        is_denoise, hist_len + 1, hist_len.new_zeros(num_decode)
-    )
+    new_hist_len = torch.where(is_denoise, hist_len + 1, hist_len.new_zeros(num_decode))
     history_len_tensor[decode_slots] = new_hist_len
 
     # SC probs: store for denoise, zero for commit
-    sc_probs[decode_slots] = probs.to(sc_probs.dtype) * is_denoise[
-        :, None, None
-    ].to(sc_probs.dtype)
+    sc_probs[decode_slots] = probs.to(sc_probs.dtype) * is_denoise[:, None, None].to(
+        sc_probs.dtype
+    )
 
     # Sampled output: commit → emit argmax_canvas, denoise → 0 (pre-zeroed)
-    sampled[decode_idx] = (
-        argmax_canvas[decode_slots].to(sampled.dtype)
-        * is_commit.unsqueeze(1).to(sampled.dtype)
-    )
+    sampled[decode_idx] = argmax_canvas[decode_slots].to(
+        sampled.dtype
+    ) * is_commit.unsqueeze(1).to(sampled.dtype)
     num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * CL
 
     # ---- Phase 6: Stability + convergence ----
@@ -650,6 +630,7 @@ def _compiled_sample_step(
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
     return scaled
+
 
 class DiffusionGemmaRequestStates:
     """Pre-allocated GPU tensors for DiffusionGemma per-request state.
@@ -746,6 +727,7 @@ class DiffusionGemmaRequestStates:
         self.accepted_canvas_history_len[slot_idx] = 0
         self.self_conditioning_probs[slot_idx] = 0
 
+
 class DiffusionGemmaModelState(ModelState):
     """ModelState for DiffusionGemma.
 
@@ -777,6 +759,7 @@ class DiffusionGemmaModelState(ModelState):
         if self.supports_mm_inputs:
             from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
             from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
+
             assert isinstance(encoder_cache, EncoderCache)
             self.encoder_cache = encoder_cache
             self.encoder_runner = EncoderRunner(
@@ -793,9 +776,7 @@ class DiffusionGemmaModelState(ModelState):
         # prepare_inputs can call embed_input_ids directly into the
         # persistent _inputs_embeds_buf, avoiding the intermediate copy
         # through encoder_runner.inputs_embeds.
-        self._pending_mm_embeds: tuple[
-            list[torch.Tensor], torch.Tensor
-        ] | None = None
+        self._pending_mm_embeds: tuple[list[torch.Tensor], torch.Tensor] | None = None
 
         diffusion_config = vllm_config.diffusion_config
         canvas_length = diffusion_config.canvas_length if diffusion_config else 32
@@ -842,17 +823,12 @@ class DiffusionGemmaModelState(ModelState):
     def get_supported_generation_tasks(self):
         return ("generate",)
 
-    def custom_sampler(
-        self,
-        sampler: Any,
-        diffusion_config: Any,
-    ) -> tuple[Any, Any] | None:
+    def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
+        diffusion_config = self.vllm_config.diffusion_config
         gen = self.gen_config
         sampler_cfg = gen.get("sampler_config") or {}
         if "EntropyBound" not in sampler_cfg.get("_cls_name", ""):
-            raise ValueError(
-                "DiffusionGemma requires an EntropyBound sampler_config"
-            )
+            raise ValueError("DiffusionGemma requires an EntropyBound sampler_config")
         entropy_bound = sampler_cfg.get("entropy_bound")
         if entropy_bound is None or entropy_bound <= 0:
             raise ValueError(
@@ -892,12 +868,8 @@ class DiffusionGemmaModelState(ModelState):
             scheduled_encoder_inputs
         )
         if mm_kwargs:
-            encoder_outputs = self.encoder_runner.execute_mm_encoder(
-                mm_kwargs
-            )
-            self.encoder_cache.encoder_outputs.update(
-                zip(mm_hashes, encoder_outputs)
-            )
+            encoder_outputs = self.encoder_runner.execute_mm_encoder(mm_kwargs)
+            self.encoder_cache.encoder_outputs.update(zip(mm_hashes, encoder_outputs))
 
         mm_embeds, is_mm_embed = self.encoder_runner.gather_mm_embeddings(
             input_batch.req_ids,
@@ -1280,7 +1252,7 @@ class DiffusionSampler:
         logprobs_tensors = None
         max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
         if max_num_logprobs >= 0:
-            CL= self.canvas_length
+            CL = self.canvas_length
             # Denoise steps that just converged: the compiled step flipped
             # is_encoder_phase from False→True. Detect as slots where
             # is_encoder_phase is now True but is_committing was False.
@@ -1293,12 +1265,10 @@ class DiffusionSampler:
                     slot = decode_slots[local_idx]
                     start = local_idx * CL
                     end = start + CL
-                    self._pending_logprobs[slot.item()] = (
-                        compute_topk_logprobs(
-                            flat_logits[start:end],
-                            max_num_logprobs,
-                            argmax_tokens[local_idx],
-                        )
+                    self._pending_logprobs[slot.item()] = compute_topk_logprobs(
+                        flat_logits[start:end],
+                        max_num_logprobs,
+                        argmax_tokens[local_idx],
                     )
 
             # Commit steps: is_committing was True at entry. Reassemble
@@ -1325,7 +1295,10 @@ class DiffusionSampler:
                     )
 
         return self._build_output(
-            input_batch, sampled, num_sampled, per_req_nlogits_np, device,
+            input_batch,
+            sampled,
+            num_sampled,
+            per_req_nlogits_np,
+            device,
             logprobs_tensors=logprobs_tensors,
         )
-
