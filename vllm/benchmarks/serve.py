@@ -166,6 +166,68 @@ async def fetch_spec_decode_metrics(
         return None
 
 
+@dataclass
+class DiffusionMetrics:
+    """Diffusion (dLLM) decoding metrics from the server's Prometheus endpoint."""
+
+    num_denoising_steps: int
+    num_canvas_positions: int
+    num_committed_tokens: int
+
+
+async def fetch_diffusion_metrics(
+    base_url: str, session: aiohttp.ClientSession
+) -> DiffusionMetrics | None:
+    """Fetch diffusion decoding metrics from the server's Prometheus endpoint.
+
+    Returns None if the model is not a diffusion model or metrics are not
+    available.
+    """
+    metrics_url = f"{base_url}/metrics"
+    try:
+        async with session.get(metrics_url) as response:
+            if response.status != 200:
+                return None
+            text = await response.text()
+
+            num_denoising_steps = 0
+            num_canvas_positions = 0
+            num_committed_tokens = 0
+            found_diffusion = False
+
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if line.startswith("vllm:diffusion"):
+                    # Extract metric name (before labels) to avoid matching
+                    # substrings inside label values.
+                    parts = line.split(None, 1)
+                    metric_name = parts[0].split("{")[0]
+                    if not metric_name.endswith("_total"):
+                        continue
+                    found_diffusion = True
+                    with contextlib.suppress(ValueError):
+                        if "num_denoising_steps" in metric_name:
+                            num_denoising_steps += int(float(parts[-1]))
+                        elif "num_canvas_positions" in metric_name:
+                            num_canvas_positions += int(float(parts[-1]))
+                        elif "num_committed_tokens" in metric_name:
+                            num_committed_tokens += int(float(parts[-1]))
+
+            if not found_diffusion:
+                return None
+
+            return DiffusionMetrics(
+                num_denoising_steps=num_denoising_steps,
+                num_canvas_positions=num_canvas_positions,
+                num_committed_tokens=num_committed_tokens,
+            )
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+
+
 class TaskType(Enum):
     GENERATION = "generation"
     POOLING = "pooling"
@@ -801,6 +863,7 @@ async def benchmark(
         print("Self timing is set, using the timestamps from the trace file.")
 
     spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
+    diffusion_metrics_before = await fetch_diffusion_metrics(base_url, session)
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -928,6 +991,32 @@ async def benchmark(
                 "per_position_acceptance_rates": per_pos_rates,
             }
 
+    diffusion_metrics_after = await fetch_diffusion_metrics(base_url, session)
+    diffusion_stats: dict[str, Any] | None = None
+    if diffusion_metrics_before is not None and diffusion_metrics_after is not None:
+        delta_steps = (
+            diffusion_metrics_after.num_denoising_steps
+            - diffusion_metrics_before.num_denoising_steps
+        )
+        delta_positions = (
+            diffusion_metrics_after.num_canvas_positions
+            - diffusion_metrics_before.num_canvas_positions
+        )
+        delta_committed = (
+            diffusion_metrics_after.num_committed_tokens
+            - diffusion_metrics_before.num_committed_tokens
+        )
+        if delta_steps > 0 and delta_committed > 0:
+            diffusion_stats = {
+                "denoising_steps": delta_steps,
+                "canvas_positions": delta_positions,
+                "committed_tokens": delta_committed,
+                "committed_throughput": delta_committed / benchmark_duration,
+                # block_size cancels: steps/canvas = positions/committed
+                "steps_per_canvas": delta_positions / delta_committed,
+                "committed_per_step": delta_committed / delta_steps,
+            }
+
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
             input_requests=input_requests,
@@ -1046,6 +1135,16 @@ async def benchmark(
             "per_position_acceptance_rates", []
         )
 
+    if diffusion_stats is not None:
+        result["diffusion_committed_throughput"] = diffusion_stats[
+            "committed_throughput"
+        ]
+        result["diffusion_steps_per_canvas"] = diffusion_stats["steps_per_canvas"]
+        result["diffusion_committed_per_step"] = diffusion_stats["committed_per_step"]
+        result["diffusion_committed_tokens"] = int(diffusion_stats["committed_tokens"])
+        result["diffusion_denoising_steps"] = int(diffusion_stats["denoising_steps"])
+        result["diffusion_canvas_positions"] = int(diffusion_stats["canvas_positions"])
+
     def process_one_metric(
         # E.g., "ttft"
         metric_attribute_name: str,
@@ -1091,7 +1190,43 @@ async def benchmark(
         process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
 
-    if spec_decode_stats is not None:
+    if diffusion_stats is not None:
+        print("{s:{c}^{n}}".format(s="Diffusion Decoding", n=50, c="-"))
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Committed throughput (tok/s):",
+                diffusion_stats["committed_throughput"],
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Denoising steps per canvas:", diffusion_stats["steps_per_canvas"]
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Committed per denoising step:",
+                diffusion_stats["committed_per_step"],
+            )
+        )
+        print(
+            "{:<40} {:<10}".format(
+                "Committed tokens:", int(diffusion_stats["committed_tokens"])
+            )
+        )
+        print(
+            "{:<40} {:<10}".format(
+                "Denoising steps:", int(diffusion_stats["denoising_steps"])
+            )
+        )
+        print(
+            "{:<40} {:<10}".format(
+                "Canvas positions evaluated:",
+                int(diffusion_stats["canvas_positions"]),
+            )
+        )
+
+    if spec_decode_stats is not None and diffusion_stats is None:
         print("{s:{c}^{n}}".format(s="Speculative Decoding", n=50, c="-"))
         print(
             "{:<40} {:<10.2f}".format(

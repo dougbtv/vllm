@@ -107,6 +107,43 @@ class Gemma4Config(VerifyAndUpdateConfig):
             )
 
 
+class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        """Force vllm_c kernels and set diffusion config for DiffusionGemma.
+
+        Inductor's native-op fusions accumulate small fp differences vs
+        the vllm_c C++ kernels across many denoise steps. Enable custom
+        ops and force vllm_c RMSNorm via IR priority to match eager.
+
+        Also auto-creates DiffusionConfig from the HF config when the
+        user didn't pass ``--diffusion-config``. Diffusion sampling params
+        are read straight from generation_config.json at sampler-build time
+        (see DiffusionGemma's custom_sampler), not injected here.
+        """
+        # Auto-create DiffusionConfig from HF config if not provided.
+        if vllm_config.diffusion_config is None:
+            from vllm.config.diffusion import DiffusionConfig
+
+            hf_config = vllm_config.model_config.hf_config
+            canvas_length = getattr(hf_config, "canvas_length", 256)
+            vllm_config.diffusion_config = DiffusionConfig(
+                canvas_length=canvas_length,
+            )
+
+        cc = vllm_config.compilation_config
+        if (
+            cc is not None
+            and "all" not in cc.custom_ops
+            and "none" not in cc.custom_ops
+        ):
+            cc.custom_ops = ["all"]
+
+        kc = vllm_config.kernel_config
+        kc.ir_op_priority.rms_norm = ["vllm_c", "native"]
+        kc.ir_op_priority.fused_add_rms_norm = ["vllm_c", "native"]
+
+
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -593,6 +630,9 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColQwen3_5": Qwen3_5ForConditionalGenerationConfig,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
+    "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
+    # TODO(diffusion): remove once checkpoints finalize to RC0.1 naming.
+    "DiffusionGemma4ModelForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,
