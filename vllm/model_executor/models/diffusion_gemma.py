@@ -54,6 +54,8 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm.model_executor.models.transformers.utils import recursive_replace_linear
@@ -524,9 +526,12 @@ def _compiled_sample_step(
     renoise_ratio_modifier: float,
     ar_mask_noise_proportion: float,
     use_autoregressive_mask: bool,
-) -> None:
+) -> torch.Tensor:
     """Compiled decode step: temperature → Gumbel sample → probs/confidence →
-    accept/renoise → convergence, all as vectorized PyTorch ops."""
+    accept/renoise → convergence, all as vectorized PyTorch ops.
+
+    Returns the temperature-scaled logits ``[num_decode, CL, vocab]`` so the
+    caller can compute logprobs outside the compiled region."""
     num_decode = decode_slots.shape[0]
     device = decode_slots.device
 
@@ -677,6 +682,7 @@ def _compiled_sample_step(
     # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
+    return scaled
 
 class DiffusionGemmaRequestStates:
     """Pre-allocated GPU tensors for DiffusionGemma per-request state.
@@ -1139,6 +1145,11 @@ class DiffusionSampler:
         self._query_lens = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
         self._num_logits = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
 
+        # Per-slot stash for logprobs computed on the converging denoise step.
+        # Populated after the post-sample kernel detects convergence; consumed
+        # on the subsequent commit step when num_sampled=CANVAS_LEN.
+        self._pending_logprobs: dict[int, LogprobsTensors] = {}
+
     def add_request(self, *args, **kwargs):
         self.sampler.add_request(*args, **kwargs)
 
@@ -1218,6 +1229,7 @@ class DiffusionSampler:
         num_sampled: torch.Tensor,
         per_req_nlogits_np: np.ndarray,
         device: torch.device,
+        logprobs_tensors: LogprobsTensors | None = None,
     ) -> SamplerOutput:
         """Compute num_rejected and build SamplerOutput."""
         num_reqs = input_batch.num_reqs
@@ -1237,7 +1249,7 @@ class DiffusionSampler:
 
         return SamplerOutput(
             sampled_token_ids=sampled,
-            logprobs_tensors=None,
+            logprobs_tensors=logprobs_tensors,
             num_nans=None,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
@@ -1272,8 +1284,12 @@ class DiffusionSampler:
         all_slots = input_batch.idx_mapping[:num_reqs]
         states = self.diffusion_states
 
+        # Snapshot which slots are committing BEFORE the compiled step runs,
+        # since it mutates is_encoder_phase (commit→False, converge→True).
+        is_committing = states.is_encoder_phase[decode_slots].clone()
+
         # --- Single compiled call: temp → sample → probs → post-process ---
-        _compiled_sample_step(
+        scaled = _compiled_sample_step(
             logits,
             decode_slots,
             decode_idx,
@@ -1306,7 +1322,59 @@ class DiffusionSampler:
             use_autoregressive_mask=self.use_autoregressive_mask,
         )
 
+        # --- Logprobs: stash on convergence, return on commit ---
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        is_decode_np = per_req_nlogits_np > 0
+
+        logprobs_tensors = None
+        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+        if max_num_logprobs >= 0:
+            CL= self.canvas_length
+            # Denoise steps that just converged: the compiled step flipped
+            # is_encoder_phase from False→True. Detect as slots where
+            # is_encoder_phase is now True but is_committing was False.
+            converged_mask = states.is_encoder_phase[decode_slots]
+            just_converged = converged_mask & ~is_committing
+            if just_converged.any():
+                flat_logits = scaled.reshape(-1, scaled.shape[-1])
+                argmax_tokens = scaled.argmax(dim=-1)
+                for local_idx in just_converged.nonzero(as_tuple=True)[0]:
+                    slot = decode_slots[local_idx]
+                    start = local_idx * CL
+                    end = start + CL
+                    self._pending_logprobs[slot.item()] = (
+                        compute_topk_logprobs(
+                            flat_logits[start:end],
+                            max_num_logprobs,
+                            argmax_tokens[local_idx],
+                        )
+                    )
+
+            # Commit steps: is_committing was True at entry. Reassemble
+            # previously stashed logprobs and attach to SamplerOutput.
+            if is_committing.any() and self._pending_logprobs:
+                parts_ids, parts_lp, parts_ranks = [], [], []
+                cu_gen: list[int] = []
+                flat_offset = 0
+                for i in range(num_reqs):
+                    cu_gen.append(flat_offset)
+                    slot = int(slots_np[i])
+                    if is_decode_np[i] and slot in self._pending_logprobs:
+                        lp = self._pending_logprobs.pop(slot)
+                        parts_ids.append(lp.logprob_token_ids)
+                        parts_lp.append(lp.logprobs)
+                        parts_ranks.append(lp.selected_token_ranks)
+                        flat_offset += CL
+                if parts_ids:
+                    logprobs_tensors = LogprobsTensors(
+                        logprob_token_ids=torch.cat(parts_ids),
+                        logprobs=torch.cat(parts_lp),
+                        selected_token_ranks=torch.cat(parts_ranks),
+                        cu_num_generated_tokens=cu_gen,
+                    )
+
         return self._build_output(
-            input_batch, sampled, num_sampled, per_req_nlogits_np, device
+            input_batch, sampled, num_sampled, per_req_nlogits_np, device,
+            logprobs_tensors=logprobs_tensors,
         )
 
