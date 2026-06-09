@@ -775,6 +775,19 @@ async fn test_app_with_request_id_headers() -> (axum::Router, MockEngineTask) {
     (app, engine_task)
 }
 
+async fn test_app_with_api_keys(api_keys: Vec<String>) -> (axum::Router, MockEngineTask) {
+    let (chat, engine_task) = test_models_with_engine_outputs_and_backend(
+        b"engine-openai-api-key",
+        default_stream_output_specs(),
+        Arc::new(FakeChatBackend::new()),
+    )
+    .await;
+    let app = build_router(Arc::new(
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat).with_api_keys(api_keys),
+    ));
+    (app, engine_task)
+}
+
 async fn test_health_app_with_engine_script<F>(
     script: F,
 ) -> (axum::Router, Arc<AppState>, MockEngineTask)
@@ -1071,6 +1084,101 @@ async fn request_id_header_echoes_incoming_header_when_enabled() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get("x-request-id").unwrap(), "req-123");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn api_key_auth_rejects_missing_token_on_guarded_route() {
+    let (mut app, _engine_task) = test_app_with_api_keys(vec!["secret".to_string()]).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(json, json!({ "error": "Unauthorized" }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn api_key_auth_rejects_wrong_token_on_guarded_route() {
+    let (mut app, _engine_task) = test_app_with_api_keys(vec!["secret".to_string()]).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn api_key_auth_accepts_matching_bearer_token_on_guarded_route() {
+    let (mut app, _engine_task) = test_app_with_api_keys(vec!["secret".to_string()]).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn api_key_auth_allows_options_without_token() {
+    let (mut app, _engine_task) = test_app_with_api_keys(vec!["secret".to_string()]).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn api_key_auth_allows_unguarded_route_without_token() {
+    let (mut app, _engine_task) = test_app_with_api_keys(vec!["secret".to_string()]).await;
+    let response = app
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4230,6 +4338,161 @@ async fn is_sleeping_route_returns_json_payload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn pause_route_uses_python_compatible_default_query_values() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            assert_eq!(utility[0].as_ref(), &[0x03]);
+
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+
+            assert_eq!(array[2], Value::from("pause_scheduler"));
+            assert_eq!(
+                array[3],
+                Value::Array(vec![Value::from("abort"), Value::from(true)])
+            );
+
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/pause")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "status": "paused" })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pause_route_rejects_invalid_mode() {
+    let (app, engine_task) =
+        test_admin_app_with_engine_script(|_dealer, _push| boxed_test_future(async move {})).await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/pause?mode=banana")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["param"], "mode");
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn resume_route_sends_no_args() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            assert_eq!(utility[0].as_ref(), &[0x03]);
+
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+
+            assert_eq!(array[2], Value::from("resume_scheduler"));
+            assert_eq!(array[3], Value::Array(Vec::new()));
+
+            send_outputs(push, utility_outputs(call_id, utility_none_result())).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/resume")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "status": "resumed" })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn is_paused_route_returns_json_payload() {
+    let (app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+        boxed_test_future(async move {
+            let utility = recv_engine_message(dealer).await;
+            assert_eq!(utility[0].as_ref(), &[0x03]);
+
+            let payload = decode_value(&utility[1]).expect("decode utility payload");
+            let array = payload.as_array().expect("utility payload array");
+            let call_id = array[1].as_u64().expect("call id");
+
+            assert_eq!(array[2], Value::from("is_scheduler_paused"));
+            assert_eq!(array[3], Value::Array(Vec::new()));
+
+            send_outputs(push, utility_outputs(call_id, utility_result_value(true))).await;
+        })
+    })
+    .await;
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("GET")
+                .uri("/is_paused")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    engine_task.await.expect("mock engine task");
+
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("decode json"),
+        json!({ "is_paused": true })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn admin_routes_are_hidden_when_dev_mode_is_disabled() {
     let (chat, engine_task) = test_chat_with_engine_handle().await;
     let app = build_router_with_dev_mode(
@@ -4244,6 +4507,9 @@ async fn admin_routes_are_hidden_when_dev_mode_is_disabled() {
         ("GET", "/is_sleeping"),
         ("POST", "/sleep"),
         ("POST", "/wake_up"),
+        ("GET", "/is_paused"),
+        ("POST", "/pause"),
+        ("POST", "/resume"),
         ("POST", "/collective_rpc"),
         ("POST", "/reset_prefix_cache"),
         ("POST", "/reset_mm_cache"),
