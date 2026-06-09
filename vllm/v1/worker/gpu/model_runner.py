@@ -123,7 +123,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
-        self.diffusion_config = vllm_config.diffusion_config
         self.observability_config = vllm_config.observability_config
 
         self.device = device
@@ -303,11 +302,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
 
-        self.num_new_sampled_tokens_per_step = (
-            self.model_state.num_new_sampled_tokens_per_step
-        )
         self.decode_query_len = (
-            self.num_speculative_steps + self.num_new_sampled_tokens_per_step
+            self.num_speculative_steps
+            + self.model_state.num_new_sampled_tokens_per_step
         )
 
         # Initialize samplers. Model states may override via custom_sampler().
@@ -321,10 +318,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_speculative_tokens=self.decode_query_len,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
             )
-            custom = self.model_state.custom_sampler(
-                self.sampler,
-                self.diffusion_config or self.speculative_config,
-            )
+            custom = self.model_state.custom_sampler(self.sampler)
+
             if custom:
                 self.sampler, self.rejection_sampler = custom
             elif self.speculative_config is not None:
@@ -1050,11 +1045,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.draft_logits,
             )
 
-        return (
-            sampler_output,
-            sampler_output.num_sampled,
-            sampler_output.num_rejected,
-        )
+        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
     def postprocess_sampled(
         self,
@@ -1445,7 +1436,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
-            # not have a speculator (i.e. self.speculator is None) 
+            # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],

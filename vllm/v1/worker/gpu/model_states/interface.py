@@ -93,20 +93,12 @@ class ModelState(ABC):
     ) -> dict[str, Any]:
         raise NotImplementedError
 
-    def custom_sampler(
-        self,
-        sampler: Any,
-        draft_config: Any,
-    ) -> tuple[Any, Any] | None:
+    def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         """Wrap or replace the default sampler.
 
         Called after model loading with the already-constructed base
         ``Sampler``.  Return ``None`` to keep the defaults, or
         ``(sampler, rejection_sampler | None)`` to override.
-
-        ``draft_config`` is ``DiffusionConfig`` for dLLM models or
-        ``SpeculativeConfig`` for speculative decoding, depending on which
-        is active.
         """
         return None
 
