@@ -142,6 +142,18 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
         kc.ir_op_priority.rms_norm = ["vllm_c", "native"]
         kc.ir_op_priority.fused_add_rms_norm = ["vllm_c", "native"]
 
+        # The diffusion sampler materializes [num_seqs, canvas_length, vocab]
+        # fp32 transients, so concurrency is memory-bound (>8 OOMs a single H200).
+        # Default to 8 when the user didn't pass --max-num-seqs.
+        # We can't see the original None here (the engine already filled a generic
+        # default), so use >= DEFAULT_MAX_NUM_SEQS as a proxy, (the default is much
+        # larger than any deliberate value for this model)
+        from vllm.config.scheduler import SchedulerConfig
+
+        sc = vllm_config.scheduler_config
+        if sc is not None and sc.max_num_seqs >= SchedulerConfig.DEFAULT_MAX_NUM_SEQS:
+            sc.max_num_seqs = 8
+
 
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
