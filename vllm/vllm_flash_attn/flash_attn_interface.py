@@ -200,6 +200,12 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     num_splits: int = 0,
+    # FA4 per-sequence causal
+    dynamic_causal: "torch.Tensor | None" = None,
+    # FA4 FlexAttention
+    mask_mod=None,
+    aux_tensors=None,
+    block_sparse_tensors=None,
     # Version selector
     fa_version: int = DEFAULT_FA_VERSION,
     s_aux=None,
@@ -381,6 +387,7 @@ def flash_attn_varlen_func(
             page_table=block_table,
             softmax_scale=softmax_scale,
             causal=causal,
+            dynamic_causal=dynamic_causal,
             softcap=softcap,
             window_size_left=real_window_size[0] if real_window_size[0] >= 0 else None,
             window_size_right=real_window_size[1] if real_window_size[1] >= 0 else None,
@@ -388,6 +395,9 @@ def flash_attn_varlen_func(
             return_lse=return_softmax_lse,
             out=out,
             learnable_sink=s_aux,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            block_sparse_tensors=block_sparse_tensors,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
