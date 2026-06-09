@@ -1007,14 +1007,16 @@ async def benchmark(
             - diffusion_metrics_before.num_committed_tokens
         )
         if delta_steps > 0 and delta_committed > 0:
+            block_size = delta_positions / delta_steps  # canvas length (CL)
+            num_canvases = delta_committed / block_size  # = number of commit steps
+            denoising_steps = delta_steps - num_canvases  # exclude commit steps
             diffusion_stats = {
-                "denoising_steps": delta_steps,
+                "denoising_steps": denoising_steps,
                 "canvas_positions": delta_positions,
                 "committed_tokens": delta_committed,
                 "committed_throughput": delta_committed / benchmark_duration,
-                # block_size cancels: steps/canvas = positions/committed
-                "steps_per_canvas": delta_positions / delta_committed,
-                "committed_per_step": delta_committed / delta_steps,
+                "steps_per_canvas": denoising_steps / num_canvases,
+                "committed_per_step": delta_committed / denoising_steps,
             }
 
     if task_type == TaskType.GENERATION:
