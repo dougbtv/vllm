@@ -110,15 +110,11 @@ class Gemma4Config(VerifyAndUpdateConfig):
 class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """Force vllm_c kernels and set diffusion config for DiffusionGemma.
+        """Set up the diffusion config and defaults for DiffusionGemma.
 
-        Inductor's native-op fusions accumulate small fp differences vs
-        the vllm_c C++ kernels across many denoise steps. Enable custom
-        ops and force vllm_c RMSNorm via IR priority to match eager.
-
-        Also auto-creates DiffusionConfig from the HF config when the
-        user didn't pass ``--diffusion-config``. Diffusion sampling params
-        are read straight from generation_config.json at sampler-build time
+        Auto-creates DiffusionConfig from the HF config when the user
+        didn't pass ``--diffusion-config``. Diffusion sampling params are
+        read straight from generation_config.json at sampler-build time
         (see DiffusionGemma's custom_sampler), not injected here.
         """
         # Auto-create DiffusionConfig from HF config if not provided.
@@ -131,17 +127,17 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
                 canvas_length=canvas_length,
             )
 
-        cc = vllm_config.compilation_config
-        if (
-            cc is not None
-            and "all" not in cc.custom_ops
-            and "none" not in cc.custom_ops
-        ):
-            cc.custom_ops = ["all"]
+        # The diffusion sampler materializes [num_seqs, canvas_length, vocab]
+        # fp32 transients, so concurrency is memory-bound (>8 OOMs a single H200).
+        # Default to 8 when the user didn't pass --max-num-seqs.
+        # We can't see the original None here (the engine already filled a generic
+        # default), so use >= DEFAULT_MAX_NUM_SEQS as a proxy, (the default is much
+        # larger than any deliberate value for this model)
+        from vllm.config.scheduler import SchedulerConfig
 
-        kc = vllm_config.kernel_config
-        kc.ir_op_priority.rms_norm = ["vllm_c", "native"]
-        kc.ir_op_priority.fused_add_rms_norm = ["vllm_c", "native"]
+        sc = vllm_config.scheduler_config
+        if sc is not None and sc.max_num_seqs >= SchedulerConfig.DEFAULT_MAX_NUM_SEQS:
+            sc.max_num_seqs = 8
 
 
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
@@ -631,8 +627,6 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
-    # TODO(diffusion): remove once checkpoints finalize to RC0.1 naming.
-    "DiffusionGemma4ModelForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,
     "Gemma3TextModel": Gemma3TextModelConfig,

@@ -31,7 +31,7 @@ import time
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -60,6 +60,80 @@ MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
 )
+
+
+async def _align_prompts_to_server_tokenizer(
+    base_url: str,
+    model_id: str,
+    input_requests: list[SampleRequest],
+    ssl_context: ssl.SSLContext | bool | None = None,
+) -> list[SampleRequest]:
+    """Re-align prompts if local/server tokenizers disagree."""
+    if not input_requests or not isinstance(input_requests[0].prompt, str):
+        return input_requests
+
+    tok_url = f"{base_url}/tokenize"
+    detok_url = f"{base_url}/detokenize"
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        sem = asyncio.Semaphore(64)
+
+        async def _tokenize(prompt: str) -> list[int]:
+            async with (
+                sem,
+                session.post(
+                    tok_url,
+                    json={
+                        "model": model_id,
+                        "prompt": prompt,
+                        "add_special_tokens": False,
+                    },
+                ) as r,
+            ):
+                r.raise_for_status()
+                return (await r.json())["tokens"]
+
+        async def _detokenize(tokens: list[int]) -> str:
+            async with (
+                sem,
+                session.post(
+                    detok_url, json={"model": model_id, "tokens": tokens}
+                ) as r,
+            ):
+                r.raise_for_status()
+                return (await r.json())["prompt"]
+
+        try:
+            first_tokens = await _tokenize(input_requests[0].prompt)
+        except Exception:
+            print("WARNING: /tokenize unavailable, skipping alignment.")
+            return input_requests
+
+        expected = input_requests[0].prompt_len
+        if len(first_tokens) == expected:
+            return input_requests
+
+        print(
+            f"WARNING: tokenizer mismatch "
+            f"(server={len(first_tokens)}, expected={expected}), "
+            f"re-aligning prompts."
+        )
+
+        async def _fix_one(req: SampleRequest) -> SampleRequest:
+            tokens = await _tokenize(req.prompt)
+            if len(tokens) <= req.prompt_len:
+                return req
+            corrected = await _detokenize(tokens[: req.prompt_len])
+            return replace(req, prompt=corrected, prompt_len=req.prompt_len)
+
+        results = await asyncio.gather(
+            *[_fix_one(r) for r in input_requests], return_exceptions=True
+        )
+        return [
+            res if not isinstance(res, BaseException) else orig
+            for orig, res in zip(input_requests, results)
+        ]
 
 
 async def get_first_model_from_server(
@@ -1007,14 +1081,16 @@ async def benchmark(
             - diffusion_metrics_before.num_committed_tokens
         )
         if delta_steps > 0 and delta_committed > 0:
+            block_size = delta_positions / delta_steps  # canvas length (CL)
+            num_canvases = delta_committed / block_size  # = number of commit steps
+            denoising_steps = delta_steps - num_canvases  # exclude commit steps
             diffusion_stats = {
-                "denoising_steps": delta_steps,
+                "denoising_steps": denoising_steps,
                 "canvas_positions": delta_positions,
                 "committed_tokens": delta_committed,
                 "committed_throughput": delta_committed / benchmark_duration,
-                # block_size cancels: steps/canvas = positions/committed
-                "steps_per_canvas": delta_positions / delta_committed,
-                "committed_per_step": delta_committed / delta_steps,
+                "steps_per_canvas": denoising_steps / num_canvases,
+                "committed_per_step": delta_committed / denoising_steps,
             }
 
     if task_type == TaskType.GENERATION:
@@ -1192,39 +1268,18 @@ async def benchmark(
 
     if diffusion_stats is not None:
         print("{s:{c}^{n}}".format(s="Diffusion Decoding", n=50, c="-"))
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Committed throughput (tok/s):",
-                diffusion_stats["committed_throughput"],
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Denoising steps per canvas:", diffusion_stats["steps_per_canvas"]
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Committed per denoising step:",
-                diffusion_stats["committed_per_step"],
-            )
-        )
-        print(
-            "{:<40} {:<10}".format(
-                "Committed tokens:", int(diffusion_stats["committed_tokens"])
-            )
-        )
-        print(
-            "{:<40} {:<10}".format(
-                "Denoising steps:", int(diffusion_stats["denoising_steps"])
-            )
-        )
-        print(
-            "{:<40} {:<10}".format(
-                "Canvas positions evaluated:",
-                int(diffusion_stats["canvas_positions"]),
-            )
-        )
+        for label, key, value_fmt in (
+            ("Committed throughput (tok/s):", "committed_throughput", "{:<10.2f}"),
+            ("Denoising steps per canvas:", "steps_per_canvas", "{:<10.2f}"),
+            ("Committed per denoising step:", "committed_per_step", "{:<10.2f}"),
+            ("Committed tokens:", "committed_tokens", "{:<10d}"),
+            ("Denoising steps:", "denoising_steps", "{:<10d}"),
+            ("Canvas positions evaluated:", "canvas_positions", "{:<10d}"),
+        ):
+            value = diffusion_stats[key]
+            if value_fmt.endswith("d}"):
+                value = int(value)
+            print("{:<40} ".format(label) + value_fmt.format(value))
 
     if spec_decode_stats is not None and diffusion_stats is None:
         print("{s:{c}^{n}}".format(s="Speculative Decoding", n=50, c="-"))
@@ -1956,6 +2011,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     # Load the dataset.
     input_requests = get_samples(args, tokenizer)
+
+    if args.dataset_name in ("random", "prefix_repetition"):
+        input_requests = await _align_prompts_to_server_tokenizer(
+            base_url, model_id, input_requests, ssl_context
+        )
+
     goodput_config_dict = check_goodput_args(args)
 
     backend = args.backend

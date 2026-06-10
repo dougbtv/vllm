@@ -358,7 +358,7 @@ def combine_sampled_and_draft_tokens(
     draft_tokens: torch.Tensor,
     cu_num_logits: torch.Tensor,
     num_logits: int,
-    num_new_sampled_tokens: int = 1, # excl accepted draft tokens, a.k.a bonus tokens
+    num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
 ) -> torch.Tensor:
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"

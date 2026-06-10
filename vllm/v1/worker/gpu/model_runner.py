@@ -90,6 +90,7 @@ from vllm.v1.worker.gpu.kv_connector import (
 )
 from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
@@ -303,11 +304,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
 
-        self.num_new_sampled_tokens_per_step = (
-            self.model_state.num_new_sampled_tokens_per_step
-        )
         self.decode_query_len = (
-            self.num_speculative_steps + self.num_new_sampled_tokens_per_step
+            self.num_speculative_steps
+            + self.model_state.num_new_sampled_tokens_per_step
         )
 
         # Initialize samplers. Model states may override via custom_sampler().
@@ -321,10 +320,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_speculative_tokens=self.decode_query_len,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
             )
-            custom = self.model_state.custom_sampler(
-                self.sampler,
-                self.diffusion_config or self.speculative_config,
-            )
+            custom = self.model_state.custom_sampler(self.sampler)
+
             if custom:
                 self.sampler, self.rejection_sampler = custom
             elif self.speculative_config is not None:
@@ -1050,11 +1047,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.draft_logits,
             )
 
-        return (
-            sampler_output,
-            sampler_output.num_sampled,
-            sampler_output.num_rejected,
-        )
+        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
     def postprocess_sampled(
         self,
@@ -1214,6 +1207,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Only first PP rank prepares multimodal embeddings.
             # NOTE(woosuk): We must call get_mm_embeddings even during dummy runs
             # to obtain inputs_embeds, because the compiled model expects this input.
+            if self.lora_config is not None:
+                set_active_mm_loras(
+                    model=self.model,
+                    lora_manager=self.lora_manager,
+                    encoder_cache=self.encoder_cache,
+                    req_id_to_index=self.req_states.req_id_to_index,
+                    lora_state=self.lora_state,
+                    scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
+                )
             inputs_embeds = self.model_state.get_mm_embeddings(
                 scheduler_output.scheduled_encoder_inputs, input_batch
             )
@@ -1445,7 +1447,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
-            # not have a speculator (i.e. self.speculator is None) 
+            # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
