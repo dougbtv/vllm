@@ -21,6 +21,7 @@ from collections.abc import Sequence
 
 import regex as re
 
+from openai.types.responses import ToolChoiceFunction
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -344,6 +345,9 @@ class Gemma4ToolParser(ToolParser):
     tool parsers.
     """
 
+    # Gemma4 emits native special-token tool calls, not generic JSON calls.
+    supports_required_and_named = False
+
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
 
@@ -393,7 +397,11 @@ class Gemma4ToolParser(ToolParser):
     ) -> ChatCompletionRequest | ResponsesRequest:
         if request.tools:
             tc = request.tool_choice
-            if tc == "required" or isinstance(tc, ChatCompletionNamedToolChoiceParam):
+            if (
+                tc == "required"
+                or isinstance(tc, ChatCompletionNamedToolChoiceParam)
+                or isinstance(tc, ToolChoiceFunction)
+            ):
                 # Do NOT call super().adjust_request() for required/named tool
                 # choice. The base implementation injects a JSON-array
                 # `structured_outputs` schema and forces xgrammar guided
